@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Factorio / test artifacts
+*.log
+*.tmp.zip
+
+# Session logs (throwaway working history)
+session-ses_*.md
+
+# OS noise
+.DS_Store
+Thumbs.db

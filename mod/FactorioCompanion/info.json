@@ -1,0 +1,8 @@
+{
+  "name": "FactorioCompanion",
+  "version": "0.1.0",
+  "title": "Companion — AI Copilot",
+  "description": "In-game AI copilot chat with live generative UI: task boards, map markers, info panels. Talks to a local opencode agent over RCON. Respects fog of war.",
+  "author": "ob1 + ox-alpha",
+  "factorio_version": "2.0"
+}
