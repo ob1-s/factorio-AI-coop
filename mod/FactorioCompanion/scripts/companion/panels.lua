@@ -8,15 +8,26 @@ storage.next_task_id = storage.next_task_id or 1
 
 local STATUS_SPRITE = {
   pending = "utility/set_bar_slot",
-  active = "utility/playing_time",
+  active = "utility/play",
   done = "utility/check_mark",
   failed = "utility/warning_icon"
 }
 
+local LOGO_SPRITE = "utility/clock"
+
 local STATUS_ORDER = { active = 1, pending = 2, done = 3, failed = 4 }
 
 function panels.valid_sprites()
-  return STATUS_SPRITE
+  local all = {}
+  for _, sprite in pairs(STATUS_SPRITE) do
+    all[#all + 1] = sprite
+  end
+  all[#all + 1] = LOGO_SPRITE
+  return all
+end
+
+function panels.logo_sprite()
+  return LOGO_SPRITE
 end
 
 local function ensure_tasks_root(player)

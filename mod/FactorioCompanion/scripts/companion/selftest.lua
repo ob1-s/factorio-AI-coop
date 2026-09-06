@@ -109,7 +109,7 @@ function selftest.run()
       assert(helpers.is_valid_sprite_path(sprite), "invalid sprite: " .. sprite)
     end
     local logo_ok, logo_err = pcall(rendering.draw_sprite, {
-      sprite = "utility/playing_time",
+      sprite = panels.logo_sprite(),
       target = { x = 0, y = -100000 },
       surface = game.surfaces.nauvis,
       time_to_live = 1

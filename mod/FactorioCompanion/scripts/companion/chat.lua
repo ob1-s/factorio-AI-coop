@@ -116,7 +116,7 @@ function chat.ensure_root(player)
   header.add({
     type = "sprite-button",
     name = "companion_chat_logo",
-    sprite = "utility/playing_time",
+    sprite = panels.logo_sprite(),
     style = "companion_logo_button"
   })
   header.add({ type = "label", name = "title", caption = {"companion.title"}, style = "frame_title" })
