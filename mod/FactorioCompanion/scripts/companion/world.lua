@@ -20,24 +20,28 @@ function world.player_state(player)
   end
   local pos = player.position
   local vehicle = player.vehicle and player.vehicle.name or nil
+  local char = player.character
   local state = {
     name = player.name,
     position = { x = util.round(pos.x, 1), y = util.round(pos.y, 1) },
     surface = player.surface.name,
-    health = player.health,
-    max_health = player.prototype and nil or nil,
+    health = char and util.round(char.health, 1) or nil,
+    health_ratio = char and util.round(char.get_health_ratio(), 2) or nil,
+    max_health = (char and (function()
+      local ok, mh = pcall(function() return char.prototype.max_health end)
+      return ok and mh or nil
+    end)()) or nil,
     walking = player.walking_state.walking,
     mining = player.mining_state.mining,
     in_combat = false,
     character_god_mode = player.character == nil,
     death_ticks_left = nil,
     vehicle = vehicle,
-    craft_queue_count = #player.crafting_queue
+    craft_queue_count = (function()
+      local q = player.crafting_queue
+      return q and #q or 0
+    end)()
   }
-  local char = player.character
-  if char then
-    state.max_health = char.prototype.max_health
-  end
   local alerts = {}
   local raw = player.get_alerts{}
   for _, by_type in pairs(raw) do
@@ -100,18 +104,24 @@ function world.overview()
     rocket = nil,
     time_played_min = util.round(game.tick / 60 / 60, 0)
   }
-  if force.get_rocket_launched and force.get_item_launched("space-science-pack") then
-    o.rocket = "space science flowing"
-  elseif game.surfaces.nauvis and surface.find_entity("rocket-silo", { x = 0, y = 0 }) then
+  do
+    local ok, launched = pcall(function()
+      return force.get_item_launched and force.get_item_launched("space-science-pack") or nil
+    end)
+    if ok and launched then
+      o.rocket = "space science flowing"
+    end
   end
   local silos = surface.find_entities_filtered({ type = "rocket-silo", limit = 5 })
   o.rockets = {}
   for _, silo in ipairs(silos) do
     if util.can_see(force, surface, silo.position) then
+      local ok_parts, parts = pcall(function() return silo.rocket_parts end)
+      local ok_need, needed = pcall(function() return silo.rocket_parts_required end)
       o.rockets[#o.rockets + 1] = {
         position = { x = util.round(silo.position.x, 0), y = util.round(silo.position.y, 0) },
-        launched = silo.launch_ended ~= nil and nil or (silo.rocket_parts or 0),
-        parts_needed = silo.rocket_parts_required,
+        rocket_parts = ok_parts and parts or nil,
+        parts_needed = ok_need and needed or nil,
         status = tostring(silo.status)
       }
     end
@@ -122,7 +132,6 @@ function world.overview()
   if player then
     o.pollution_on_player_chunk = util.round(surface.get_pollution(player.position), 0)
   end
-  o.charted_chunks = force.get_charted_forces and nil or nil
   return o
 end
 

@@ -111,6 +111,14 @@ function selftest.run()
     assert(panels.update_task(player, tid, { status = "done" }), "update failed")
     assert(panels.remove_task(player, tid), "remove failed")
     assert(#panels.get_tasks(player) == 1)
+    -- clean up test residue so the real task board stays empty
+    for _, t in ipairs(panels.get_tasks(player)) do
+      panels.remove_task(player, t.id)
+    end
+    local board = player.gui.screen.companion_tasks
+    if board and board.valid then
+      board.visible = false
+    end
   end)
 
   check("ui_spec_dispatch", function()
@@ -118,6 +126,7 @@ function selftest.run()
     assert(r.ok, "info.show failed")
     r = util.dec(ui.dispatch({ kind = "bogus.kind" }))
     assert(not r.ok, "bogus kind should fail")
+    panels.hide_info(player) -- don't leave the test panel on screen
   end)
 
   check("sprites_valid", function()

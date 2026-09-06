@@ -51,6 +51,7 @@ local function ensure_tasks_root(player)
       sprite = "utility/close",
       style = "frame_action_button"
     })
+    header.drag_target = root
     root.add({ type = "scroll-pane", name = "body", direction = "vertical", style = "companion_scroll" })
   end
   return root
@@ -191,6 +192,7 @@ local function ensure_info_root(player)
     local spacer = header.add({ type = "empty-widget", name = "spacer", style = "companion_header_spacer" })
     spacer.style.horizontally_stretchable = true
     header.add({ type = "sprite-button", name = "companion_info_close", sprite = "utility/close", style = "frame_action_button" })
+    header.drag_target = root
     root.add({ type = "scroll-pane", name = "body", style = "companion_scroll" })
   end
   return root

@@ -165,6 +165,7 @@ function chat.ensure_root(player)
   root.style.width = 440
   body.style.height = 380
 
+  header.drag_target = root
   root.location = { x = 60, y = 120 }
   return root
 end

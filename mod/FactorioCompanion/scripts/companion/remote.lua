@@ -104,7 +104,7 @@ function remote_if.register()
     if not ok then
       return util.err(result)
     end
-    return util.begin_query("overview", result)
+    return util.begin_query("overview", util.enc(result))
   end
 
   iface.player_state = function()
@@ -112,7 +112,7 @@ function remote_if.register()
     if not state then
       return util.err("no player")
     end
-    return util.begin_query("player_state", state)
+    return util.begin_query("player_state", util.enc(state))
   end
 
   iface.inventory = function()
@@ -120,7 +120,7 @@ function remote_if.register()
     if not ok then
       return util.err(result)
     end
-    return util.begin_query("inventory", result)
+    return util.begin_query("inventory", util.enc(result))
   end
 
   iface.research = function()
@@ -128,7 +128,7 @@ function remote_if.register()
     if not ok then
       return util.err(result)
     end
-    return util.begin_query("research", result)
+    return util.begin_query("research", util.enc(result))
   end
 
   iface.area = function(surface, x, y, radius)
