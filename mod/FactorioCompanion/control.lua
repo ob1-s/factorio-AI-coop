@@ -54,7 +54,7 @@ script.on_configuration_changed(function()
     if info then
       info.destroy()
     end
-    local pill = player.gui.screen.companion_chat_pill
+    local pill = player.gui.relative.companion_chat_pill
     if pill then
       pill.destroy()
     end

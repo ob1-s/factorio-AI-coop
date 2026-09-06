@@ -26,7 +26,7 @@ end
 function markers.clear(player_index)
   local m = storage.markers[player_index]
   if m then
-    rendering.clear(util.MOD_NAME, game.get_player(player_index).surface)
+    rendering.clear(util.MOD_NAME)
     storage.markers[player_index] = nil
     return true
   end
@@ -41,9 +41,9 @@ function markers.remove_expired(player_index)
   local dirty = false
   for _, entry in ipairs(list) do
     if entry.expires and game.tick > entry.expires then
-      if rendering.is_valid(entry.render_ids[1]) then
-        for _, rid in ipairs(entry.render_ids) do
-          rendering.destroy(rid)
+      for _, obj in ipairs(entry.render_objects or {}) do
+        if type(obj) == "userdata" and obj.valid then
+          obj:destroy()
         end
       end
       dirty = true
@@ -65,10 +65,10 @@ function markers.draw(spec, player)
   end
   local color = markers.color(spec.color)
   local ttl_ticks = spec.expire_seconds and (spec.expire_seconds * 60) or (10 * 60 * 60)
-  local ids = {}
+  local objs = {}
   local radius = spec.radius or 1.5
 
-  ids[#ids + 1] = rendering.draw_circle({
+  objs[#objs + 1] = rendering.draw_circle({
     color = color,
     width = 2,
     radius = radius,
@@ -81,7 +81,7 @@ function markers.draw(spec, player)
     visible = true
   })
 
-  ids[#ids + 1] = rendering.draw_text({
+  objs[#objs + 1] = rendering.draw_text({
     text = spec.label or "",
     target = { x = pos.x, y = pos.y - radius - 0.8 },
     surface = surface,
@@ -90,12 +90,12 @@ function markers.draw(spec, player)
     alignment = "center",
     players = { player.index },
     time_to_live = ttl_ticks,
-    visible_in_map_view = spec.on_map ~= false,
+    render_mode = "game",
     visible = true
   })
 
   if spec.icon then
-    ids[#ids + 1] = rendering.draw_sprite({
+    objs[#objs + 1] = rendering.draw_sprite({
       sprite = spec.icon,
       target = pos,
       surface = surface,
@@ -103,7 +103,7 @@ function markers.draw(spec, player)
       y_scale = 0.6,
       players = { player.index },
       time_to_live = ttl_ticks,
-      visible_in_map_view = spec.on_map ~= false,
+      render_mode = "game",
       visible = true
     })
   end
@@ -114,7 +114,7 @@ function markers.draw(spec, player)
   table.insert(storage.markers[player.index], {
     id = id,
     label = spec.label,
-    render_ids = ids,
+    render_objects = objs,
     expires = ttl_ticks < 3600000 and (game.tick + ttl_ticks) or nil,
     position = pos
   })
@@ -124,9 +124,9 @@ end
 
 function markers.arrow(from_pos, to_pos, color_name, player, seconds)
   local surface = player.surface
-  local ids = {}
+  local objs = {}
   local ttl = (seconds or 20) * 60
-  ids[#ids + 1] = rendering.draw_line({
+  objs[#objs + 1] = rendering.draw_line({
     from = from_pos,
     to = to_pos,
     color = markers.color(color_name),
@@ -137,9 +137,9 @@ function markers.arrow(from_pos, to_pos, color_name, player, seconds)
     dash_length = 0.8,
     gap_length = 0.5,
     visible = true,
-    visible_in_map_view = true
+    render_mode = "game"
   })
-  return ids
+  return objs
 end
 
 function markers.list(player)
@@ -158,9 +158,9 @@ function markers.remove_by_id(player, mid)
   end
   for i, entry in ipairs(list) do
     if entry.id == tonumber(mid) then
-      for _, rid in ipairs(entry.render_ids) do
-        if rendering.is_valid(rid) then
-          rendering.destroy(rid)
+      for _, obj in ipairs(entry.render_objects or {}) do
+        if type(obj) == "userdata" and obj.valid then
+          obj:destroy()
         end
       end
       table.remove(list, i)

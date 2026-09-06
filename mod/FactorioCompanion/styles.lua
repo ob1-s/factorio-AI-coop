@@ -157,3 +157,13 @@ styles["companion_table_value"] = {
   type = "label_style",
   parent = "label"
 }
+
+styles["companion_chat_user"] = {
+  type = "frame_style",
+  parent = "companion_chat_bubble"
+}
+
+styles["companion_chat_agent"] = {
+  type = "frame_style",
+  parent = "companion_chat_bubble"
+}

@@ -16,8 +16,10 @@ function selftest.run()
       results[#results + 1] = { test = name, passed = true, skipped = true, error = nil }
       return
     end
-    local ok, err = pcall(fn)
-    results[#results + 1] = { test = name, passed = ok, error = ok and nil or tostring(err):sub(1, 300) }
+    local ok, err = xpcall(fn, function(e)
+      return tostring(e) .. "\\n" .. debug.traceback(e, 2)
+    end)
+    results[#results + 1] = { test = name, passed = ok, error = ok and nil or tostring(err):sub(1, 800) }
   end
 
   check("ping", function()
@@ -42,6 +44,20 @@ function selftest.run()
     chat.stream_end(player, "")
     assert(#storage.chat_log[player.index] > 0)
     chat.close(player)
+  end)
+
+  check("chat.badge", function()
+    local player = game.get_player(1)
+    chat.close(player)
+    chat.update_badge(player)
+    local pill = player.gui.relative.companion_chat_pill
+    assert(pill and pill.valid, "pill missing from gui.relative")
+    chat.open(player)
+    chat.update_badge(player)
+    assert(pill.visible == false, "pill should hide while chat open")
+    chat.close(player)
+    chat.update_badge(player)
+    assert(pill.visible == true, "pill should show while chat closed")
   end)
 
   check("chat.deliver_while_closed", function()
@@ -114,7 +130,7 @@ function selftest.run()
       surface = game.surfaces.nauvis,
       time_to_live = 1
     })
-    assert(logo_ok, "utility/playing_time invalid: " .. tostring(logo_err))
+    assert(logo_ok, "logo sprite invalid: " .. tostring(logo_err))
   end)
 
   local passed = 0

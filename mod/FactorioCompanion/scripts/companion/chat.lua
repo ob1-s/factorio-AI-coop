@@ -92,7 +92,7 @@ local function render_log(player)
     local lbl = frame.add({ type = "label", caption = storage.stream.text .. " ▌", style = "companion_chat_text" })
     lbl.style.horizontally_stretchable = true
   end
-  body.scroll_to_bottom()
+  root.body.scroll_to_bottom()
   storage.dirty[player_index(player)] = nil
 end
 
@@ -154,7 +154,6 @@ function chat.ensure_root(player)
     style = "companion_input"
   })
   field.style.horizontally_stretchable = true
-  field.word_wrap = false
   input_row.add({
     type = "sprite-button",
     name = "send",
@@ -173,7 +172,10 @@ end
 function chat.open(player)
   local root = chat.ensure_root(player)
   root.visible = true
-  root.input.focus()
+  local field = root.input_row.input
+  if field and field.valid then
+    pcall(function() field.focus() end)
+  end
   render_log(player)
   storage.unread = 0
   chat.update_badge(player)
@@ -200,12 +202,12 @@ function chat.toggle(player)
 end
 
 function chat.update_badge(player)
-  local root = player.gui.screen.companion_chat_pill
+  local root = player.gui.relative.companion_chat_pill
   if not (root and root.valid) then
-    root = player.gui.screen.add({
+    root = player.gui.relative.add({
       type = "sprite-button",
       name = "companion_chat_pill",
-      sprite = "utility/playing_time",
+      sprite = panels.logo_sprite(),
       mouse_button_filter = { "left" },
       style = "companion_pill_button",
       tooltip = {"companion.open-tooltip"}
@@ -214,11 +216,7 @@ function chat.update_badge(player)
   end
   local anchor = {
     gui = defines.relative_gui_type.controller_gui,
-    position = defines.relative_gui_position.right,
-    names = {
-      [defines.gui_type.item] = {},
-      [defines.gui_type.entity] = {}
-    }
+    position = defines.relative_gui_position.right
   }
   root.anchor = anchor
   root.caption = storage.unread > 0 and tostring(storage.unread) or ""
@@ -309,9 +307,9 @@ end
 function chat.on_gui_click(player, element_name)
   if element_name == "send" then
     local root = chat.ensure_root(player)
-    local text = root.input.text
+    local text = root.input_row.input.text
     if text and text ~= "" then
-      root.input.text = ""
+      root.input_row.input.text = ""
       chat.enqueue_user_message(player, text)
       chat.set_status(player, {"companion.status-thinking"})
     end
@@ -337,13 +335,13 @@ function chat.on_gui_confirmed(player, element_name)
   if element_name == "input" then
     local root = player.gui.screen.companion_chat
     if root then
-      local text = root.input.text
+      local text = root.input_row.input.text
       if text and text ~= "" then
-        root.input.text = ""
+        root.input_row.input.text = ""
         chat.enqueue_user_message(player, text)
         chat.set_status(player, {"companion.status-thinking"})
       end
-      root.input.focus()
+      root.input_row.input.focus()
     end
     return true
   end
