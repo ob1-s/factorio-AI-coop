@@ -279,6 +279,8 @@ function chat.stream_end(player, final_text)
       storage.stream = nil
       if t ~= "" then
         chat.deliver_agent_message(player, t)
+      elseif chat.is_open(player) then
+        render_log(player)  -- drop the typing bubble when nothing arrived
       end
     end
   end

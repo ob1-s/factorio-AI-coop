@@ -66,6 +66,24 @@ class Game:
             return lua_str(json.dumps(value))
         return lua_str(value)
 
+    @staticmethod
+    def _parse_envelope(raw, fn):
+        """Parse the first complete JSON envelope; tolerate concatenated dupes."""
+        raw = raw.strip()
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
+        decoder = json.JSONDecoder()
+        idx = raw.find("{")
+        while idx != -1:
+            try:
+                obj, end = decoder.raw_decode(raw, idx)
+                return obj
+            except ValueError:
+                idx = raw.find("{", idx + 1)
+        raise GameError(f"non-json response from {fn}: {raw[:200]!r}")
+
     def _call(self, fn, *args, collect_ms=1200, retries=2):
         bits = [lua_str(IFACE), lua_str(fn)] + [self._lit(a) for a in args]
         cmd = f"/silent-command rcon.print(remote.call({', '.join(bits)}))"
@@ -77,7 +95,7 @@ class Game:
                 time.sleep(0.4)
                 continue
             try:
-                envelope = json.loads(raw)
+                envelope = self._parse_envelope(raw, fn)
             except ValueError:
                 raise GameError(f"non-json response from {fn}: {raw[:200]!r}")
             if envelope.get("ok") is not True:

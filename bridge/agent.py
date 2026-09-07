@@ -18,7 +18,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gameapi
-import gemini
+if os.environ.get("COMPANION_BACKEND") == "gemini":
+    import gemini as llm  # type: ignore
+else:
+    import openai as llm  # type: ignore
 
 SYSTEM_PROMPT = """You are Companion, a friendly AI copilot living inside the player's \
 Factorio game through the FactorioCompanion mod. The player talks to you through a \
@@ -67,7 +70,7 @@ class Agent:
                     self.game.stream_append(delta[i:i + 120])
                     time.sleep(0.03)
 
-            full, mode = gemini.ask(self.model, contents, SYSTEM_PROMPT, on_delta)
+            full, mode = llm.ask(self.model, contents, SYSTEM_PROMPT, on_delta)
             self.game.stream_end(full)
             self.history.append(turn)
             self.history.append({"role": "model", "parts": [{"text": full}]})
@@ -90,6 +93,8 @@ class Agent:
         while True:
             try:
                 messages = self.game.drain_outbox()
+                if not isinstance(messages, list):
+                    messages = list(messages.values()) if isinstance(messages, dict) else []
                 if messages:
                     text = "\n".join(str(m.get("text", "")).strip()
                                      for m in messages if m.get("text"))
@@ -114,7 +119,7 @@ class Agent:
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", default=os.environ.get("COMPANION_MODEL", gemini.DEFAULT_MODEL))
+    parser.add_argument("--model", default=os.environ.get("COMPANION_MODEL", llm.DEFAULT_MODEL))
     parser.add_argument("--poll", type=float, default=0.5)
     parser.add_argument("--host", default=os.environ.get("RCON_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("RCON_PORT", "34973")))

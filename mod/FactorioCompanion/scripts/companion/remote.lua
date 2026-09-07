@@ -6,7 +6,7 @@ local chat = require("scripts.companion.chat")
 local ui = require("scripts.companion.ui")
 local selftest = require("scripts.companion.selftest")
 
-local remote_if = { version = "0.1.0" }
+local remote_if = { version = "0.1.3" }
 
 local function get_player()
   local p = game.get_player(1)

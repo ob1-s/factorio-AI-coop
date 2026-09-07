@@ -1,11 +1,16 @@
 """Minimal dependency-free Google Gemini REST client with SSE streaming."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
 BASE = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_MODEL = "gemini-flash-latest"
+DEFAULT_MODEL = "gemini-pro-latest"
+
+# transient upstream failures worth retrying (overload, rate limit, gateway)
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+RETRY_DELAYS = (1.5, 4.0)
 
 
 class GeminiError(Exception):
@@ -20,12 +25,30 @@ def api_key():
     raise GeminiError("no API key found: set GEMINI_API_KEY")
 
 
-def _post(url, payload, timeout):
+def _post(url, payload, timeout, retries=1 + len(RETRY_DELAYS)):
+    """POST with retry+backoff on transient HTTP errors / network blips."""
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    return urllib.request.urlopen(req, timeout=timeout)
+    last_exc = None
+    for attempt in range(retries):
+        req = urllib.request.Request(
+            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            last_exc = GeminiError(f"HTTP {exc.code}: {detail}")
+            if exc.code in RETRYABLE_STATUS and attempt < retries - 1:
+                time.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
+                continue
+            raise last_exc
+        except Exception as exc:
+            last_exc = GeminiError(f"request failed: {exc}")
+            if attempt < retries - 1:
+                time.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
+                continue
+            raise last_exc
+    raise last_exc or GeminiError("request failed")
 
 
 def _payload(contents, system, temperature):
