@@ -196,6 +196,31 @@ function remote_if.register()
     return selftest.run()
   end
 
+  iface.set_companion_level = function(level)
+    local campaign = require("scripts.companion.campaign")
+    return util.ok({ capabilities = campaign.set_level(level), level = campaign.get_level() })
+  end
+
+  iface.get_companion_level = function()
+    local campaign = require("scripts.companion.campaign")
+    return util.ok({ level = campaign.get_level(), capabilities = campaign.get_capabilities() })
+  end
+
+  iface.unlock_capability = function(feature_key)
+    local campaign = require("scripts.companion.campaign")
+    return util.ok({ unlocked = campaign.unlock(feature_key), capabilities = campaign.get_capabilities() })
+  end
+
+  iface.lock_capability = function(feature_key)
+    local campaign = require("scripts.companion.campaign")
+    return util.ok({ locked = campaign.lock(feature_key), capabilities = campaign.get_capabilities() })
+  end
+
+  iface.get_timeline_info = function()
+    local campaign = require("scripts.companion.campaign")
+    return util.ok({ world_id = campaign.get_world_id(), conversation_head = campaign.get_conversation_head() })
+  end
+
   remote.add_interface("copilot", iface)
 end
 

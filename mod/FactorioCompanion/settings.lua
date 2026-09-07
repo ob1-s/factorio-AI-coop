@@ -14,5 +14,15 @@ data:extend({
     minimum_value = 20,
     maximum_value = 1000,
     order = "b"
+  },
+  {
+    type = "int-setting",
+    name = "companion-daemon-port",
+    setting_type = "runtime-global",
+    default_value = 34200,
+    minimum_value = 1024,
+    maximum_value = 65535,
+    order = "c"
   }
 })
+

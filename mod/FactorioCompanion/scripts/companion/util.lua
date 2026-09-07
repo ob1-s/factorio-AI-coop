@@ -46,12 +46,25 @@ function util.pos_to_chunk(pos)
   return { x = math.floor(pos.x / 32), y = math.floor(pos.y / 32) }
 end
 
-function util.can_see(force, surface, pos)
+function util.is_charted(force, surface, pos)
   if not force or not surface or not pos then
     return false
   end
   return force.is_chunk_charted(surface, util.pos_to_chunk(pos))
 end
+
+function util.is_visible(force, surface, pos)
+  if not force or not surface or not pos then
+    return false
+  end
+  local ok, visible = pcall(force.is_chunk_visible, surface, util.pos_to_chunk(pos))
+  return ok and visible == true
+end
+
+function util.can_see(force, surface, pos)
+  return util.is_visible(force, surface, pos)
+end
+
 
 local MAX_INLINE = 1800
 local CHUNK_SIZE = 1400

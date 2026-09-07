@@ -229,10 +229,45 @@ function chat.set_status(player, status_text)
   root.header.status.caption = status_text or ""
 end
 
-function chat.deliver_agent_message(player, text)
+local STATUS_LOCALES = {
+  offline = { "companion.status-offline" },
+  connecting = { "companion.status-connecting" },
+  ready = { "companion.status-ready" },
+  thinking = { "companion.status-thinking" },
+  streaming = { "companion.status-typing" },
+  error = { "companion.status-error" }
+}
+
+function chat.update_connection_status(player, status_str)
+  local loc = STATUS_LOCALES[status_str] or status_str
+  chat.set_status(player, loc)
+end
+
+function chat.send_user_input(player, text)
+  local msg_id = chat.enqueue_user_message(player, text)
+  local ok_t, transport = pcall(require, "scripts.companion.transport_udp")
+  local ok_c, campaign = pcall(require, "scripts.companion.campaign")
+  local ok_x, context = pcall(require, "scripts.companion.context")
+
+  if ok_t and ok_c and ok_x then
+    local turn_id = campaign.next_turn_id()
+    local parent_turn_id = campaign.get_conversation_head()
+    local ctx = context.build(player)
+    transport.send_user_message(player, text, turn_id, parent_turn_id, ctx)
+
+    if transport.get_status() == "offline" then
+      chat.system_notice(player, { "companion.offline-warning" })
+    end
+  else
+    chat.set_status(player, { "companion.status-thinking" })
+  end
+  return msg_id
+end
+
+function chat.deliver_agent_message(player, text, turn_id)
   local id = storage.next_msg_id
   storage.next_msg_id = id + 1
-  local entry = { id = id, kind = "agent", from = "companion", text = text, tick = game.tick }
+  local entry = { id = id, kind = "agent", from = "companion", text = text, tick = game.tick, turn_id = turn_id }
   chat.push_history(entry, player)
   if storage.stream then
     storage.stream = nil
@@ -242,19 +277,19 @@ function chat.deliver_agent_message(player, text)
   else
     storage.unread = storage.unread + 1
     if settings.get_player_settings(player)["companion-notifications"].value then
-      player.print({"companion.notify-new-message"})
+      player.print({ "companion.notify-new-message" })
     end
   end
   chat.update_badge(player)
   return id
 end
 
-function chat.stream_start(player)
-  storage.stream = { text = "" }
+function chat.stream_start(player, model)
+  storage.stream = { text = "", model = model }
   if chat.is_open(player) then
     render_log(player)
   end
-  chat.set_status(player, {"companion.status-thinking"})
+  chat.set_status(player, { "companion.status-typing" })
 end
 
 function chat.stream_append(player, chunk)
@@ -270,21 +305,31 @@ function chat.stream_append(player, chunk)
   end
 end
 
-function chat.stream_end(player, final_text)
+function chat.stream_end(player, final_text, turn_id)
   if final_text and final_text ~= "" then
-    chat.deliver_agent_message(player, final_text)
+    chat.deliver_agent_message(player, final_text, turn_id)
   else
     if storage.stream then
       local t = storage.stream.text
       storage.stream = nil
       if t ~= "" then
-        chat.deliver_agent_message(player, t)
+        chat.deliver_agent_message(player, t, turn_id)
       elseif chat.is_open(player) then
-        render_log(player)  -- drop the typing bubble when nothing arrived
+        render_log(player)
       end
     end
   end
-  chat.set_status(player, "")
+  local ok_t, transport = pcall(require, "scripts.companion.transport_udp")
+  local st = (ok_t and transport.get_status()) or "ready"
+  chat.update_connection_status(player, st)
+end
+
+function chat.stream_error(player, error_message)
+  storage.stream = nil
+  chat.system_notice(player, "[Companion error: " .. tostring(error_message) .. "]")
+  local ok_t, transport = pcall(require, "scripts.companion.transport_udp")
+  local st = (ok_t and transport.get_status()) or "ready"
+  chat.update_connection_status(player, st)
 end
 
 function chat.drain_outbox(limit)
@@ -313,8 +358,7 @@ function chat.on_gui_click(player, element_name)
     local text = root.input_row.input.text
     if text and text ~= "" then
       root.input_row.input.text = ""
-      chat.enqueue_user_message(player, text)
-      chat.set_status(player, {"companion.status-thinking"})
+      chat.send_user_input(player, text)
     end
     return true
   elseif element_name == "companion_chat_close" then
@@ -328,7 +372,7 @@ function chat.on_gui_click(player, element_name)
     chat.open(player)
     return true
   elseif element_name == "companion_chat_logo" then
-    chat.system_notice(player, {"companion.hint"})
+    chat.system_notice(player, { "companion.hint" })
     return true
   end
   return false
@@ -341,8 +385,7 @@ function chat.on_gui_confirmed(player, element_name)
       local text = root.input_row.input.text
       if text and text ~= "" then
         root.input_row.input.text = ""
-        chat.enqueue_user_message(player, text)
-        chat.set_status(player, {"companion.status-thinking"})
+        chat.send_user_input(player, text)
       end
       root.input_row.input.focus()
     end
