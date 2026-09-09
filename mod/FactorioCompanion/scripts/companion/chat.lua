@@ -5,12 +5,10 @@ local chat = {}
 
 storage = storage or {}
 storage.chat_log = storage.chat_log or {}
-storage.outbox = storage.outbox or {}
 storage.next_msg_id = storage.next_msg_id or 1
-storage.agent_busy = false
-storage.unread = 0
-storage.stream = nil
-storage.dirty = {}
+storage.unread = storage.unread or 0
+storage.stream = storage.stream or nil
+storage.dirty = storage.dirty or {}
 
 local MAX_MESSAGE_LENGTH = 2000
 
@@ -19,15 +17,24 @@ local function player_index(player)
 end
 
 function chat.push_history(entry, player)
-  local limit = settings.get_player_settings(player)["companion-chat-history-limit"].value or 200
-  local log = storage.chat_log[player_index(player)]
+  local limit = 200
+  local ok, player_settings = pcall(settings.get_player_settings, player)
+  if ok and player_settings and player_settings["companion-chat-history-limit"] then
+    limit = tonumber(player_settings["companion-chat-history-limit"].value) or limit
+  end
+  local index = player_index(player)
+  storage.chat_log[index] = storage.chat_log[index] or {}
+  local log = storage.chat_log[index]
   log[#log + 1] = entry
   while #log > limit do
     table.remove(log, 1)
   end
 end
 
-function chat.enqueue_user_message(player, text)
+function chat.record_user_message(player, text, turn_id, exchange_id)
+  if not player or type(text) ~= "string" or text == "" then
+    return nil
+  end
   local id = storage.next_msg_id
   storage.next_msg_id = id + 1
   local entry = {
@@ -37,10 +44,11 @@ function chat.enqueue_user_message(player, text)
     text = string.sub(text, 1, MAX_MESSAGE_LENGTH),
     tick = game.tick,
     surface = player.surface.name,
-    position = { x = math.floor(player.position.x), y = math.floor(player.position.y) }
+    position = { x = math.floor(player.position.x), y = math.floor(player.position.y) },
+    turn_id = turn_id,
+    exchange_id = exchange_id
   }
   chat.push_history(entry, player)
-  storage.outbox[#storage.outbox + 1] = entry
   return id
 end
 
@@ -62,7 +70,7 @@ local function render_log(player)
   end
   local body = root.body.log_flow
   body.clear()
-  for _, entry in ipairs(storage.chat_log[player_index(player)]) do
+  for _, entry in ipairs(storage.chat_log[player_index(player)] or {}) do
     local row = body.add({ type = "flow", direction = "vertical" })
     row.style.horizontally_stretchable = true
     local meta_style = entry.kind == "user" and "companion_chat_meta_user" or "companion_chat_meta"
@@ -243,28 +251,81 @@ function chat.update_connection_status(player, status_str)
   chat.set_status(player, loc)
 end
 
+local function notice_once(player, key, message)
+  storage.chat_notice = storage.chat_notice or {}
+  local tick = game.tick or 0
+  local last = storage.chat_notice[key]
+  -- Repeated clicks while the daemon is down should not fill the chat log.
+  if last and tick >= last and tick - last < 600 then
+    return
+  end
+  storage.chat_notice[key] = tick
+  chat.system_notice(player, message)
+end
+
+local function unavailable_notice(player, reason)
+  if reason == "busy" then
+    notice_once(player, "busy", { "companion.busy-warning" })
+  elseif reason == "connecting" then
+    notice_once(player, "connecting", { "companion.connecting-warning" })
+  elseif reason == "error" then
+    notice_once(player, "error", { "companion.error-warning" })
+  else
+    notice_once(player, "offline", { "companion.offline-warning" })
+  end
+end
+
 function chat.send_user_input(player, text)
-  local msg_id = chat.enqueue_user_message(player, text)
+  if not player then
+    return nil, "no_player"
+  end
+  if type(text) ~= "string" then
+    return nil, "invalid_message"
+  end
+  text = string.sub(text, 1, MAX_MESSAGE_LENGTH)
+  if text == "" then
+    return nil, "empty_message"
+  end
+
   local ok_t, transport = pcall(require, "scripts.companion.transport_udp")
   local ok_c, campaign = pcall(require, "scripts.companion.campaign")
   local ok_x, context = pcall(require, "scripts.companion.context")
 
   if ok_t and ok_c and ok_x then
+    local can_send, reason = transport.can_start_exchange(player)
+    if not can_send then
+      unavailable_notice(player, reason)
+      return nil, reason
+    end
+
     local turn_id = campaign.next_turn_id()
     local parent_turn_id = campaign.get_conversation_head()
-    local ctx = context.build(player)
-    transport.send_user_message(player, text, turn_id, parent_turn_id, ctx)
-
-    if transport.get_status() == "offline" then
-      chat.system_notice(player, { "companion.offline-warning" })
+    local context_ok, ctx = pcall(context.build, player)
+    if not context_ok or type(ctx) ~= "table" then
+      transport.set_status("error", player)
+      notice_once(player, "context", { "companion.context-error" })
+      return nil, "context_error"
     end
+
+    local sent, err, exchange = transport.send_user_message(player, text, turn_id, parent_turn_id, ctx)
+    if not sent then
+      unavailable_notice(player, err)
+      return nil, err
+    end
+
+    local msg_id = chat.record_user_message(player, text, turn_id, exchange and exchange.id or nil)
+    return msg_id, nil
   else
-    chat.set_status(player, { "companion.status-thinking" })
+    chat.update_connection_status(player, "error")
+    notice_once(player, "integration", { "companion.context-error" })
+    return nil, "integration_unavailable"
   end
-  return msg_id
 end
 
 function chat.deliver_agent_message(player, text, turn_id)
+  if not player or type(text) ~= "string" then
+    return nil
+  end
   local id = storage.next_msg_id
   storage.next_msg_id = id + 1
   local entry = { id = id, kind = "agent", from = "companion", text = text, tick = game.tick, turn_id = turn_id }
@@ -275,8 +336,13 @@ function chat.deliver_agent_message(player, text, turn_id)
   if chat.is_open(player) then
     render_log(player)
   else
-    storage.unread = storage.unread + 1
-    if settings.get_player_settings(player)["companion-notifications"].value then
+    storage.unread = (tonumber(storage.unread) or 0) + 1
+    local notifications = true
+    local ok, player_settings = pcall(settings.get_player_settings, player)
+    if ok and player_settings and player_settings["companion-notifications"] then
+      notifications = player_settings["companion-notifications"].value == true
+    end
+    if notifications then
       player.print({ "companion.notify-new-message" })
     end
   end
@@ -285,6 +351,9 @@ function chat.deliver_agent_message(player, text, turn_id)
 end
 
 function chat.stream_start(player, model)
+  if not player then
+    return
+  end
   storage.stream = { text = "", model = model }
   if chat.is_open(player) then
     render_log(player)
@@ -293,6 +362,9 @@ function chat.stream_start(player, model)
 end
 
 function chat.stream_append(player, chunk)
+  if not player or type(chunk) ~= "string" then
+    return
+  end
   if not storage.stream then
     storage.stream = { text = "" }
   end
@@ -306,42 +378,30 @@ function chat.stream_append(player, chunk)
 end
 
 function chat.stream_end(player, final_text, turn_id)
-  if final_text and final_text ~= "" then
-    chat.deliver_agent_message(player, final_text, turn_id)
-  else
-    if storage.stream then
-      local t = storage.stream.text
-      storage.stream = nil
-      if t ~= "" then
-        chat.deliver_agent_message(player, t, turn_id)
-      elseif chat.is_open(player) then
-        render_log(player)
-      end
-    end
+  if not player or type(final_text) ~= "string" then
+    return
   end
-  local ok_t, transport = pcall(require, "scripts.companion.transport_udp")
-  local st = (ok_t and transport.get_status()) or "ready"
-  chat.update_connection_status(player, st)
+  -- The daemon's full_text is authoritative.  Never promote the cosmetic
+  -- partial stream to history when full_text is empty or missing.
+  storage.stream = nil
+  if final_text ~= "" then
+    chat.deliver_agent_message(player, final_text, turn_id)
+  elseif chat.is_open(player) then
+    render_log(player)
+  end
 end
 
 function chat.stream_error(player, error_message)
   storage.stream = nil
-  chat.system_notice(player, "[Companion error: " .. tostring(error_message) .. "]")
-  local ok_t, transport = pcall(require, "scripts.companion.transport_udp")
-  local st = (ok_t and transport.get_status()) or "ready"
-  chat.update_connection_status(player, st)
-end
-
-function chat.drain_outbox(limit)
-  limit = tonumber(limit) or 20
-  local out = {}
-  while #out < limit and #storage.outbox > 0 do
-    out[#out + 1] = table.remove(storage.outbox, 1)
+  if player then
+    chat.system_notice(player, "[Companion error: " .. tostring(error_message) .. "]")
   end
-  return out
 end
 
 function chat.system_notice(player, text)
+  if not player then
+    return nil
+  end
   local id = storage.next_msg_id
   storage.next_msg_id = id + 1
   chat.push_history({ id = id, kind = "system", from = "", text = text, tick = game.tick }, player)
@@ -357,8 +417,10 @@ function chat.on_gui_click(player, element_name)
     local root = chat.ensure_root(player)
     local text = root.input_row.input.text
     if text and text ~= "" then
-      root.input_row.input.text = ""
-      chat.send_user_input(player, text)
+      local msg_id = chat.send_user_input(player, text)
+      if msg_id then
+        root.input_row.input.text = ""
+      end
     end
     return true
   elseif element_name == "companion_chat_close" then
@@ -384,8 +446,10 @@ function chat.on_gui_confirmed(player, element_name)
     if root then
       local text = root.input_row.input.text
       if text and text ~= "" then
-        root.input_row.input.text = ""
-        chat.send_user_input(player, text)
+        local msg_id = chat.send_user_input(player, text)
+        if msg_id then
+          root.input_row.input.text = ""
+        end
       end
       root.input_row.input.focus()
     end

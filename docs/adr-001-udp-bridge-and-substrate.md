@@ -1,53 +1,111 @@
-# ADR 001: Pure Localhost UDP Transport & Substrate Architecture for Factorio AI Companion
+# ADR 001: native UDP bridge and rollback-safe companion substrate
 
 ## Status
-Accepted
+
+Accepted for pre-v0.
 
 ## Context
-Factorio 2.0 / Space Age introduced a native UDP scripting interface:
-- CLI option: `--enable-lua-udp=<port>`
-- Lua API: `helpers.send_udp(port, data, player_index)` and `helpers.recv_udp(player_index)`
-- Event: `defines.events.on_udp_packet_received`
 
-Prior prototypes in community tooling used RCON (`/silent-command rcon.print(...)`) to bridge external scripts with Factorio. However:
-1. RCON requires running Factorio as a dedicated or hosted multiplayer server (`--start-server` or `--host`), which prevents standard single-player campaign launches from the Steam menu.
-2. RCON poll-loops block on round-trips and cannot stream tokens or deltas fluidly into the GUI.
-3. RCON operates at high privilege (`/c` console access) whereas native UDP can be cleanly restricted to a dedicated JSON protocol parsed entirely within Lua sandbox event handlers.
+The companion needs a local path between a normal single-player Factorio 2.0
+save and an OpenAI-compatible streaming model. The path must remain responsive
+while generation runs, survive daemon restarts, and avoid allowing a save
+rollback to expose future conversation or hidden map state.
+
+Factorio provides the native Lua UDP helper/event surface used here:
+[`LuaHelpers.send_udp` and `recv_udp`](https://lua-api.factorio.com/latest/classes/LuaHelpers.html),
+[`on_udp_packet_received`](https://lua-api.factorio.com/latest/events.html), and
+force chart/visibility queries such as
+[`LuaForce.is_chunk_charted`](https://lua-api.factorio.com/latest/classes/LuaForce.html).
+
+Earlier versions used an RCON polling agent and a persisted conversational
+outbox. That required server-style orchestration, coupled game actions to a
+privileged console surface, and could not provide a clean streaming contract
+for a standard single-player launch.
 
 ## Decisions
 
-### 1. Pure Native UDP as Product Transport
-The mod communicates strictly over localhost UDP:
-- Factorio listens on port `34199` (configured via launch flag `--enable-lua-udp 34199`).
-- Companion Daemon listens on port `34200`.
-- All inter-process traffic is single-datagram UTF-8 JSON.
-- RCON is eliminated from production architecture. Automated unit tests mock the transport layer.
+### 1. Native localhost UDP is the sole product path
 
-### 2. Visible vs. Charted Fog-of-War Enforcement
-To guarantee that the AI copilot never acts as an unfair radar or cheats the simulation:
-- **Charted Knowledge** (`force.is_chunk_charted`): Used strictly for static geography (discovered surface bounds, ore deposit locations as last seen, known structural footprints).
-- **Visible Perception** (`force.is_chunk_visible` or `surface.is_chunk_visible`): Mandatory for all real-time dynamic facts: biter positions, current enemy attacks, live health/pollution metrics, vehicle movement, and active production status.
-- Non-visible and uncharted entities are mathematically dropped before serialization into the context JSON payload.
+The Factorio mod sends compact UTF-8 JSON datagrams to daemon UDP port `34200`.
+Factorio receives replies through the native UDP socket enabled with
+`--enable-lua-udp=34199`; the daemon replies to each packet's source address
+and port. Both sides enforce a 4096-byte datagram ceiling.
 
-### 3. Lightweight Streaming without TCP Emulation
-Because received UDP datagrams are integrated into Factorio's input actions:
-- We explicitly reject per-delta ACKs and retransmission mechanisms over UDP.
-- Instead, the daemon streams grouped chunks (`assistant_delta`, cadence ~80–150ms) for cosmetic GUI typing, followed by an authoritative `assistant_end(full_text)`.
-- If a delta is dropped, the final packet immediately repairs the UI without engine overhead.
+RCON is not used for conversation, context collection, message delivery, or
+streaming. The retained remote interface is limited to diagnostics, capability
+administration, and UI/test utilities. The old Python RCON modules are not
+imported by the product daemon; `bridge.agent` is only a compatibility shim to
+`bridge.daemon`.
 
-### 4. Save Rollback & Conversation Tree Branching
-To prevent the daemon from "remembering the future" when a player reloads a past save:
-- Every save stores a canonical `world_id` and `conversation_head` (turn ID).
-- The daemon structures dialogue history as a directed acyclic tree of turns.
-- Loading an earlier save points `conversation_head` to an ancestor node, causing the daemon to branch rather than contaminate the conversation timeline with future knowledge.
+### 2. The receive boundary is defensive and versioned
 
-### 5. Capabilities as Feature Flags
-The progression layer is defined by granular capability keys (`"telemetry"`, `"research"`, `"inventory"`, `"radar_vision"`, `"map_analysis"`, `"markers"`, `"tasks"`). Numerical levels (0..4) are mapped as convenience milestone presets.
+The daemon parses bytes as UTF-8, rejects malformed JSON and invalid envelope
+types/integers without taking down its receive loop, then applies message-
+specific validation before session or provider work. The Lua side applies the
+same packet-size/envelope checks and wraps its event handler so a malformed
+packet cannot crash the game script.
 
-### 6. Single-Player Scope for v0
-Factorio multiplayer requires network-wide input-action synchronization for external UDP. Single-player Space Age is the sole focus for v0; multiplayer is explicitly deferred.
+The protocol does not emulate TCP. There are no per-delta acknowledgements or
+retransmissions. `seq` lets the mod discard duplicate/out-of-order assistant
+packets, and the final `assistant_end.full_text` repairs any cosmetic streaming
+loss.
+
+### 3. Streaming is asynchronous and one exchange is active per world
+
+The daemon receive loop never waits for the model. Each accepted request sends
+`assistant_start`, runs the OpenAI-compatible SSE call in a worker, batches
+provider text into small `assistant_delta` packets, and ends with one
+authoritative `assistant_end`. Heartbeats continue while a worker is running.
+
+Only one generation runs per world. A configurable worker limit allows
+independent worlds to make progress without interleaving two requests from one
+save. Duplicate requests with the same fingerprint are ignored while active;
+recent completed exchanges can replay their final packet.
+
+### 4. Durable timeline uses globally unique daemon turn IDs
+
+SQLite stores `worlds` and parent-linked `turns`. A turn is inserted as
+`pending`, becomes visible to model history only when its non-empty assistant
+text and the world's head are committed atomically, and is marked `aborted` on
+handled failure. SQLite WAL/full-synchronous settings and a serialized store
+lock provide the durability boundary for the small local database.
+
+Factorio owns a save-persisted `world_id` and `conversation_head`. Its runtime
+request/turn IDs are provisional aliases because their counters can rewind with
+a save. The daemon instead issues a globally unique `turn_<random>` primary
+key. On reload, a saved ancestor moves the active head without deleting later
+descendants, so new dialogue forms a branch and cannot contaminate the active
+history with the abandoned future.
+
+### 5. Model context is explicit, capability-gated, and fog-safe
+
+The mod builds the exact context snapshot placed in `user_message`. Capability
+keys gate telemetry, research, inventory, radar perception, and charted map
+metadata. Dynamic entity/alert snapshots require both charted and currently
+visible chunks. Charted knowledge is limited to static sampled bounds; the
+context excludes hidden entities/resources, production/power internals,
+inventories of world entities, and enemy evolution state.
+
+Transport and timeline metadata remain packet fields and are not appended to the
+model context. Alternate Lua callers cannot inject an unchecked context because
+the send boundary rebuilds it through the capability-gated builder.
+
+### 6. Pre-v0 scope is single-player and read-only
+
+The substrate supports local chat, grounded read-only context, streamed GUI
+display, durable branching, reconnect, and diagnostics. Multiplayer, remote
+network peers, autonomous game actions, and campaign/progression content are
+explicitly deferred.
 
 ## Consequences
-- Singleplayer players must configure `--enable-lua-udp 34199` once in their launch options.
-- The companion mod works in standard singleplayer menu launches without dedicated server orchestration.
-- The Lua state remains strictly authoritative for save progression and fog of war.
+
+Players must start the daemon and add one Factorio launch option. A provider
+failure is visible as a request error and leaves the saved head unchanged.
+Dropped UDP deltas do not corrupt the completed answer. A daemon restart or
+Factorio reload creates a new transport generation and rejects late packets.
+
+The 4096-byte budget means context and final answers must remain compact. The
+daemon reports `MODEL_TOO_LARGE` rather than committing a completion that the
+mod cannot receive. UDP is intentionally local and best-effort; the heartbeat,
+generation checks, duplicate policy, and authoritative final packet cover the
+failure modes needed for pre-v0 without adding a second transport protocol.

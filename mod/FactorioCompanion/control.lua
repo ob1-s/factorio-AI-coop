@@ -8,7 +8,10 @@ local transport_udp = require("scripts.companion.transport_udp")
 
 local function ensure_storage()
   storage.chat_log = storage.chat_log or {}
-  storage.outbox = storage.outbox or {}
+  -- Migration: the persisted RCON conversational queue is obsolete.  User
+  -- messages are recorded only after a successful UDP dispatch.
+  storage.outbox = nil
+  storage.agent_busy = nil
   storage.next_msg_id = storage.next_msg_id or 1
   storage.queries = storage.queries or {}
   storage.next_query_id = storage.next_query_id or 1
@@ -18,7 +21,6 @@ local function ensure_storage()
   storage.next_task_id = storage.next_task_id or 1
   storage.panel_spec = storage.panel_spec or {}
   storage.dirty = storage.dirty or {}
-  storage.agent_busy = storage.agent_busy or false
   storage.unread = storage.unread or 0
   storage.stream = storage.stream or nil
   campaign.ensure_storage()
@@ -64,6 +66,7 @@ script.on_configuration_changed(function()
       pill.destroy()
     end
     chat.update_badge(player)
+    transport_udp.send_hello(player)
   end
 end)
 
@@ -197,4 +200,3 @@ commands.add_command("companion-lock", "Lock a companion capability flag", funct
 end)
 
 util.log("control.lua loaded")
-

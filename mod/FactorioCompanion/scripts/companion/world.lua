@@ -1,365 +1,676 @@
 local util = require("scripts.companion.util")
+local campaign = require("scripts.companion.campaign")
 
 local world = {}
 
-local function surface_by_name(name)
+local MAX_VISIBLE_ENTITIES = 25
+local MAX_VISIBLE_ALERTS = 25
+
+local function get_player(player)
+  if player then
+    return player
+  end
+  if game and game.get_player then
+    return game.get_player(1)
+  end
+  return nil
+end
+
+local function safe_force()
+  return game and game.forces and game.forces.player or nil
+end
+
+local function surface_by_name(name, player)
+  player = get_player(player)
   if name == nil or name == "" then
-    return game.surfaces.nauvis or game.surfaces[1]
+    return (player and player.surface) or (game.surfaces.nauvis or game.surfaces[1])
+  end
+  if type(name) ~= "string" then
+    return nil
   end
   return game.surfaces[name]
 end
 
-local function safe_force()
-  return game.forces.player
+local function same_surface(left, right)
+  if not left or not right then
+    return false
+  end
+  if left.index and right.index then
+    return left.index == right.index
+  end
+  return left.name == right.name
+end
+
+local function numeric(value)
+  return tonumber(value)
+end
+
+local function entity_position(entity)
+  local ok, position = pcall(function() return entity.position end)
+  if not ok or not position or type(position.x) ~= "number" or type(position.y) ~= "number" then
+    return nil
+  end
+  return position
+end
+
+local function entity_is_valid(entity)
+  local ok, valid = pcall(function()
+    return entity and entity.valid ~= false
+  end)
+  return ok and valid == true
+end
+
+-- This is the only predicate used for current entity perception.  is_chunk_visible
+-- currently implies charted in Factorio, but checking both states explicitly keeps
+-- the boundary obvious and prevents a future/API/mock regression from widening it.
+local function entity_is_currently_visible(entity, force, surface)
+  if not force or not surface or not entity_is_valid(entity) then
+    return false
+  end
+
+  local entity_surface
+  local ok_surface, value = pcall(function() return entity.surface end)
+  if ok_surface then
+    entity_surface = value
+  end
+  if entity_surface and not same_surface(entity_surface, surface) then
+    return false
+  end
+
+  local position = entity_position(entity)
+  if not position then
+    return false
+  end
+
+  local visibility_surface = entity_surface or surface
+  local ok_charted, charted = pcall(function()
+    return util.is_charted(force, visibility_surface, position)
+  end)
+  if not ok_charted or charted ~= true then
+    return false
+  end
+  return util.is_visible(force, visibility_surface, position)
+end
+
+local function entity_snapshot(entity, force, surface)
+  if not entity_is_currently_visible(entity, force, surface) then
+    return nil
+  end
+  local position = entity_position(entity)
+  local ok_name, name = pcall(function() return entity.name end)
+  local ok_type, entity_type = pcall(function() return entity.type end)
+  if not ok_name or not name or name == "character" then
+    return nil
+  end
+
+  -- Keep this deliberately small.  In particular, do not serialize unit numbers,
+  -- forces, inventories, energy, recipes, status, or other engine/debug state.
+  return {
+    name = tostring(name),
+    type = ok_type and entity_type and tostring(entity_type) or nil,
+    x = util.round(position.x, 0),
+    y = util.round(position.y, 0)
+  }
+end
+
+-- Public only as a narrow testable seam; callers still need to opt into the
+-- radar capability before using the resulting data.
+function world.filter_visible_entities(candidates, force, surface, limit)
+  limit = math.max(0, math.min(tonumber(limit) or MAX_VISIBLE_ENTITIES, 2000))
+  local visible = {}
+  for _, entity in ipairs(candidates or {}) do
+    if #visible >= limit then
+      break
+    end
+    local snapshot = entity_snapshot(entity, force, surface)
+    if snapshot then
+      visible[#visible + 1] = snapshot
+    end
+  end
+  table.sort(visible, function(a, b)
+    if a.name ~= b.name then
+      return a.name < b.name
+    end
+    if a.x ~= b.x then
+      return a.x < b.x
+    end
+    return a.y < b.y
+  end)
+  return visible
+end
+
+local function visible_alerts(player, force, surface)
+  local alerts = {}
+  local ok_raw, raw_alerts = pcall(function() return player.get_alerts{} end)
+  if not ok_raw or type(raw_alerts) ~= "table" then
+    return alerts
+  end
+
+  local function append(alert_type, entry)
+    if #alerts >= MAX_VISIBLE_ALERTS or type(entry) ~= "table" then
+      return
+    end
+    local entity = entry.entity or entry.target
+    local snapshot = entity and entity_snapshot(entity, force, surface) or nil
+    if snapshot then
+      alerts[#alerts + 1] = {
+        type = tostring(alert_type),
+        name = snapshot.name,
+        x = snapshot.x,
+        y = snapshot.y
+      }
+    end
+  end
+
+  -- Factorio's alert table is grouped by alert source and then alert type.  Be
+  -- defensive about shape changes, but never accept an alert with only a raw
+  -- position: it has no visibility-verifiable entity target.
+  for outer_type, by_type in pairs(raw_alerts) do
+    if type(by_type) == "table" then
+      if by_type.entity or by_type.target then
+        append(outer_type, by_type)
+      else
+        for alert_type, entries in pairs(by_type) do
+          if type(entries) == "table" then
+            for _, entry in pairs(entries) do
+              append(alert_type, entry)
+              if #alerts >= MAX_VISIBLE_ALERTS then
+                break
+              end
+            end
+          end
+          if #alerts >= MAX_VISIBLE_ALERTS then
+            break
+          end
+        end
+      end
+    end
+    if #alerts >= MAX_VISIBLE_ALERTS then
+      break
+    end
+  end
+
+  table.sort(alerts, function(a, b)
+    if a.type ~= b.type then
+      return a.type < b.type
+    end
+    if a.x ~= b.x then
+      return a.x < b.x
+    end
+    return a.y < b.y
+  end)
+  return alerts
+end
+
+function world.visible_perception(player)
+  if not campaign.has("radar_vision") then
+    return nil
+  end
+  player = get_player(player)
+  local force = safe_force()
+  local surface = player and player.surface
+  if not player or not force or not surface then
+    return nil
+  end
+
+  local position = player.position
+  local radius = 48
+  local candidates = {}
+  pcall(function()
+    candidates = surface.find_entities_filtered({
+      area = { { position.x - radius, position.y - radius }, { position.x + radius, position.y + radius } },
+      limit = 100
+    })
+  end)
+
+  return {
+    nearby_entities = world.filter_visible_entities(candidates, force, surface, MAX_VISIBLE_ENTITIES),
+    alerts = visible_alerts(player, force, surface)
+  }
 end
 
 function world.player_state(player)
-  player = player or game.get_player(1)
+  if not campaign.has("telemetry") then
+    return nil
+  end
+  player = get_player(player)
   if not player then
     return nil
   end
-  local pos = player.position
-  local vehicle = player.vehicle and player.vehicle.name or nil
-  local char = player.character
+
+  local position = player.position
+  local character = player.character
   local state = {
     name = player.name,
-    position = { x = util.round(pos.x, 1), y = util.round(pos.y, 1) },
+    position = { x = util.round(position.x, 1), y = util.round(position.y, 1) },
     surface = player.surface.name,
-    health = char and util.round(char.health, 1) or nil,
-    health_ratio = char and util.round(char.get_health_ratio(), 2) or nil,
-    max_health = (char and (function()
-      local ok, mh = pcall(function() return char.prototype.max_health end)
-      return ok and mh or nil
+    health = character and util.round(character.health, 1) or nil,
+    health_ratio = character and util.round(character.get_health_ratio(), 2) or nil,
+    max_health = (character and (function()
+      local ok, max_health = pcall(function() return character.prototype.max_health end)
+      return ok and max_health or nil
     end)()) or nil,
     walking = player.walking_state.walking,
     mining = player.mining_state.mining,
-    in_combat = false,
-    character_god_mode = player.character == nil,
-    death_ticks_left = nil,
-    vehicle = vehicle,
+    vehicle = player.vehicle and player.vehicle.name or nil,
     craft_queue_count = (function()
-      local q = player.crafting_queue
-      return q and #q or 0
+      local ok, queue = pcall(function() return player.crafting_queue end)
+      return ok and queue and #queue or 0
     end)()
   }
-  local alerts = {}
-  local raw = player.get_alerts{}
-  for _, by_type in pairs(raw) do
-    for alert_type, list in pairs(by_type) do
-      for _, entry in pairs(list) do
-        local a = { type = tostring(alert_type) }
-        local ent = entry.entity or entry.target
-        if ent and ent.valid then
-          a.name = ent.name
-          a.position = { x = util.round(ent.position.x, 0), y = util.round(ent.position.y, 0) }
-        end
-        alerts[#alerts + 1] = a
-      end
-    end
-  end
-  state.alerts = alerts
+
+  -- Alerts are dynamic perception, not generic telemetry.  They are exposed only
+  -- through visible_perception when radar_vision is unlocked.
   return state
 end
 
 function world.inventory(player)
-  player = player or game.get_player(1)
-  local function summarize(inv, limit)
-    if not inv or not inv.valid then
+  if not campaign.has("inventory") then
+    return nil
+  end
+  player = get_player(player)
+  if not player then
+    return nil
+  end
+
+  local function summarize(inventory_id, limit)
+    local ok_inventory, inventory = pcall(function()
+      return player.get_inventory(inventory_id)
+    end)
+    if not ok_inventory or not inventory or inventory.valid == false then
       return {}
     end
-    local counts = inv.get_contents()
-    local out = {}
-    for name, count in pairs(counts) do
-      out[#out + 1] = { item = name, count = count }
+    local ok_contents, contents = pcall(function() return inventory.get_contents() end)
+    if not ok_contents or type(contents) ~= "table" then
+      return {}
     end
-    table.sort(out, function(a, b) return a.count > b.count end)
-    limit = limit or 40
+    local out = {}
+    for key, stack in pairs(contents) do
+      -- Factorio 2.0 with Quality returns an array of
+      -- {name, quality, count}; older saves/API variants may return a
+      -- name -> count dictionary.  Normalize both without ever retaining
+      -- the engine's raw stack table in model context.
+      local name, quality, count
+      if type(stack) == "table" then
+        name = stack.name or key
+        quality = stack.quality
+        count = tonumber(stack.count)
+      else
+        name = key
+        count = tonumber(stack)
+      end
+      if name and count then
+        local entry = { item = tostring(name), count = count }
+        if quality then
+          entry.quality = tostring(quality)
+        end
+        out[#out + 1] = entry
+      end
+    end
+    table.sort(out, function(a, b)
+      if a.count ~= b.count then
+        return a.count > b.count
+      end
+      return a.item < b.item
+    end)
     while #out > limit do
       table.remove(out)
     end
     return out
   end
-  return {
-    main = summarize(player.get_inventory(defines.inventory.character_main), 50),
-    trash = summarize(player.get_inventory(defines.inventory.character_trash), 20),
-    armor_modules = summarize(player.get_inventory(defines.inventory.character_armor), 10),
-    gun_ammo = summarize(player.get_inventory(defines.inventory.character_gun_ammo), 10)
-  }
-end
 
-function world.overview()
-  local force = safe_force()
-  local surface = surface_by_name(nil)
-  local player = game.get_player(1)
-  local o = {
-    tick = game.tick,
-    players_online = #game.connected_players,
-    surfaces = {},
-    evolution = force.get_evolution_factor(surface),
-    pollution_on_player_chunk = nil,
-    research = world.research(),
-    player = world.player_state(player),
-    production_top = world.production_top(force, surface, 12),
-    power = world.power(surface, force),
-    rocket = nil,
-    time_played_min = util.round(game.tick / 60 / 60, 0)
+  return {
+    main = summarize(defines.inventory.character_main, 50),
+    trash = summarize(defines.inventory.character_trash, 20),
+    armor_modules = summarize(defines.inventory.character_armor, 10),
+    gun_ammo = summarize(defines.inventory.character_gun_ammo, 10)
   }
-  do
-    local ok, launched = pcall(function()
-      return force.get_item_launched and force.get_item_launched("space-science-pack") or nil
-    end)
-    if ok and launched then
-      o.rocket = "space science flowing"
-    end
-  end
-  local silos = surface.find_entities_filtered({ type = "rocket-silo", limit = 5 })
-  o.rockets = {}
-  for _, silo in ipairs(silos) do
-    if util.can_see(force, surface, silo.position) then
-      local ok_parts, parts = pcall(function() return silo.rocket_parts end)
-      local ok_need, needed = pcall(function() return silo.rocket_parts_required end)
-      o.rockets[#o.rockets + 1] = {
-        position = { x = util.round(silo.position.x, 0), y = util.round(silo.position.y, 0) },
-        rocket_parts = ok_parts and parts or nil,
-        parts_needed = ok_need and needed or nil,
-        status = tostring(silo.status)
-      }
-    end
-  end
-  for name, s in pairs(game.surfaces) do
-    o.surfaces[#o.surfaces + 1] = name
-  end
-  if player then
-    o.pollution_on_player_chunk = util.round(surface.get_pollution(player.position), 0)
-  end
-  return o
 end
 
 function world.research()
+  if not campaign.has("research") then
+    return nil
+  end
   local force = safe_force()
-  local techs = {}
-  local queue = force.research_queue
-  local q = {}
-  for _, item in ipairs(queue or {}) do
-    q[#q + 1] = { tech = item.technology.name, infinite_level = item.infinite_level or nil }
+  if not force then
+    return nil
   end
-  local current = force.current_research
-  local progress = nil
-  if current then
-    progress = util.round(force.research_progress, 3)
-  end
-  return {
-    queue = q,
-    current = current and current.name or nil,
-    progress = progress,
-    unlocked_count = force.technologies and (function()
-      local n = 0
-      for _, t in pairs(force.technologies) do
-        if t.researched then
-          n = n + 1
+
+  local queue = {}
+  local ok_queue, research_queue = pcall(function() return force.research_queue end)
+  if ok_queue then
+    for _, technology in ipairs(research_queue or {}) do
+      -- Factorio 2.0 exposes research_queue as technology IDs (strings).
+      -- Keep the table fallback for older/proxied API shapes used by tests.
+      local name
+      if type(technology) == "string" then
+        name = technology
+      elseif type(technology) == "table" then
+        local ok_name, value = pcall(function()
+          return technology.name or (technology.technology and technology.technology.name)
+        end)
+        if ok_name then
+          name = value
         end
       end
-      return n
-    end)() or nil
+      if name then
+        queue[#queue + 1] = { tech = tostring(name) }
+      end
+    end
+  end
+
+  local current
+  local ok_current, current_research = pcall(function() return force.current_research end)
+  if ok_current and current_research then
+    local ok_name, name = pcall(function() return current_research.name end)
+    current = ok_name and name or nil
+  end
+
+  local progress
+  if current then
+    local ok_progress, value = pcall(function() return force.research_progress end)
+    if ok_progress and type(value) == "number" then
+      progress = util.round(value, 3)
+    end
+  end
+
+  local unlocked_count
+  local ok_technologies, technologies = pcall(function() return force.technologies end)
+  if ok_technologies and technologies then
+    unlocked_count = 0
+    for _, technology in pairs(technologies) do
+      local ok_researched, researched = pcall(function() return technology.researched end)
+      if ok_researched and researched then
+        unlocked_count = unlocked_count + 1
+      end
+    end
+  end
+
+  return {
+    queue = queue,
+    current = current,
+    progress = progress,
+    unlocked_count = unlocked_count
   }
 end
 
-function world.production_top(force, surface, top_n)
-  top_n = top_n or 15
-  local stats = force.get_item_production_statistics(surface)
-  local items = {}
-  for name, count in pairs(stats.input_counts) do
-    items[#items + 1] = { item = name, produced_last_interval = stats.get_flow_count(name, defines.flow_precision_index.five_minutes, defines.flow_direction.input), consumed_last_interval = stats.get_flow_count(name, defines.flow_precision_index.five_minutes, defines.flow_direction.output), stock_delta = count }
+-- Only map-level chart state is retained as charted knowledge.  We intentionally
+-- do not enumerate current entities/resources from charted-but-fogged chunks:
+-- that would turn a present-day engine query into false historical knowledge.
+local function charted_bounds_data(surface, player, force)
+  player = get_player(player)
+  if not surface or not player or not force then
+    return { charted = false }
   end
-  table.sort(items, function(a, b) return math.abs(a.produced_last_interval) > math.abs(b.produced_last_interval) end)
-  local out = {}
-  for i = 1, math.min(top_n, #items) do
-    out[i] = items[i]
-  end
-  return out
-end
 
-function world.power(surface, force)
-  local poles = surface.find_entities_filtered({ type = "electric-pole", force = force, limit = 400 })
-  local worst = nil
-  local checked = 0
-  local seen_networks = {}
-  for _, pole in ipairs(poles) do
-    if pole.valid and pole.electric_network_id and not seen_networks[pole.electric_network_id] then
-      seen_networks[pole.electric_network_id] = true
-      local stats = pole.electric_network_statistics
-      if stats then
-        local gen, drain = 0, 0
-        for name, count in pairs(stats.output_counts) do
-          gen = gen + stats.get_flow_count(name, defines.flow_precision_index.ten_seconds, defines.flow_direction.input)
-        end
-        for name, count in pairs(stats.input_counts) do
-          drain = drain + stats.get_flow_count(name, defines.flow_precision_index.ten_seconds, defines.flow_direction.input)
-        end
-        checked = checked + 1
-        local ratio = drain > 0 and gen / drain or 1
-        if not worst or ratio < worst.ratio then
-          worst = { ratio = util.round(ratio, 3), generation_per_s = util.round(gen, 1), consumption_per_s = util.round(drain, 1), sample_pole = { x = util.round(pole.position.x, 0), y = util.round(pole.position.y, 0) } }
-        end
+  local center = util.pos_to_chunk(player.position)
+  local minx, miny, maxx, maxy = math.huge, math.huge, -math.huge, -math.huge
+  for dx = -64, 64, 4 do
+    for dy = -64, 64, 4 do
+      local chunk = { x = center.x + dx, y = center.y + dy }
+      local ok, charted = pcall(function()
+        return util.is_charted(force, surface, { x = chunk.x * 32, y = chunk.y * 32 })
+      end)
+      if ok and charted then
+        local tx, ty = chunk.x * 32, chunk.y * 32
+        minx = math.min(minx, tx)
+        miny = math.min(miny, ty)
+        maxx = math.max(maxx, tx)
+        maxy = math.max(maxy, ty)
       end
     end
-    if checked >= 6 then
-      break
-    end
   end
-  return worst
+
+  if minx == math.huge then
+    return { charted = false }
+  end
+  return {
+    charted = true,
+    approx_bounds = { min_x = minx, min_y = miny, max_x = maxx, max_y = maxy },
+    sampled_radius_chunks = 64,
+    sample_stride_chunks = 4
+  }
 end
 
-function world.area(surface_name, x, y, radius)
-  radius = math.min(radius or 32, 128)
-  local surface = surface_by_name(surface_name)
+function world.charted_knowledge(surface, player)
+  if not campaign.has("map_analysis") then
+    return nil
+  end
+  player = get_player(player)
+  surface = surface or (player and player.surface)
+  local force = safe_force()
+  if not player or not surface or not force then
+    return nil
+  end
+  return {
+    surface = surface.name,
+    bounds = charted_bounds_data(surface, player, force)
+  }
+end
+
+-- Kept for the legacy remote query, but it shares the same map_analysis gate and
+-- contains chart state only.  It never returns entities, resources, or evolution.
+function world.charted_bounds(surface_name, player)
+  if not campaign.has("map_analysis") then
+    return util.err("capability_locked:map_analysis")
+  end
+  player = get_player(player)
+  local surface = surface_by_name(surface_name, player)
+  if not surface then
+    return util.err("no such surface")
+  end
+  local force = safe_force()
+  return util.ok(charted_bounds_data(surface, player, force))
+end
+
+-- Legacy overview callers are deliberately reduced to the same capability-gated
+-- surface as the UDP context.  Debug/global simulation fields are not exported.
+function world.overview(player)
+  player = get_player(player)
+  local overview = { capabilities = campaign.get_capabilities() }
+  if not player then
+    return overview
+  end
+
+  if campaign.has("telemetry") then
+    overview.player = world.player_state(player)
+  end
+  if campaign.has("research") then
+    overview.research = world.research()
+  end
+  if campaign.has("inventory") then
+    overview.inventory = world.inventory(player)
+  end
+  if campaign.has("radar_vision") then
+    overview.visible_perception = world.visible_perception(player)
+  end
+  if campaign.has("map_analysis") then
+    overview.charted_knowledge = world.charted_knowledge(player.surface, player)
+  end
+  return overview
+end
+
+local function bounded_radius(value, fallback, maximum)
+  local radius = numeric(value) or fallback
+  return math.max(0, math.min(radius, maximum))
+end
+
+function world.area(surface_name, x, y, radius, player)
+  if not campaign.has("radar_vision") then
+    return util.err("capability_locked:radar_vision")
+  end
+  x, y = numeric(x), numeric(y)
+  if not x or not y then
+    return util.err("invalid position")
+  end
+  player = get_player(player)
+  local surface = surface_by_name(surface_name, player)
   if not surface then
     return util.err("no such surface: " .. tostring(surface_name))
   end
   local force = safe_force()
-  if not util.can_see(force, surface, { x = x, y = y }) then
-    return util.ok({ area = { x = x, y = y, radius = radius }, visible = false, note = "fog of war: this chunk has not been charted; no information available" })
+  if not force then
+    return util.err("no player force")
   end
-  local found = surface.find_entities_filtered({ area = { { x - radius, y - radius }, { x + radius, y + radius } }, limit = 2000 })
+  radius = bounded_radius(radius, 32, 128)
+  local center = { x = x, y = y }
+  local ok_charted, charted = pcall(function() return util.is_charted(force, surface, center) end)
+  if not ok_charted or not charted then
+    return util.ok({
+      area = { x = x, y = y, radius = radius },
+      surface = surface.name,
+      charted = false,
+      visible = false,
+      entities = {},
+      note = "map area is uncharted; no entity information available"
+    })
+  end
+
+  local ok_found, found = pcall(function()
+    return surface.find_entities_filtered({
+      area = { { x - radius, y - radius }, { x + radius, y + radius } },
+      limit = 2000
+    })
+  end)
+  if not ok_found then
+    return util.err("unable to inspect visible area")
+  end
+
   local groups = {}
-  local total = 0
-  local hidden = 0
-  for _, ent in ipairs(found) do
-    if ent.valid and ent.name ~= "character" then
-      if util.can_see(force, surface, ent.position) then
-        local key = ent.name
-        local g = groups[key]
-        if not g then
-          g = { entity = key, type = ent.type, count = 0 }
-          groups[key] = g
-          total = total + 1
-        end
-        g.count = g.count + 1
-      else
-        hidden = hidden + 1
-      end
+  for _, entity in ipairs(world.filter_visible_entities(found or {}, force, surface, 2000)) do
+    local key = entity.name
+    local group = groups[key]
+    if not group then
+      group = { entity = key, type = entity.type, count = 0 }
+      groups[key] = group
     end
+    group.count = group.count + 1
   end
+
   local list = {}
-  for _, g in pairs(groups) do
-    list[#list + 1] = g
+  for _, group in pairs(groups) do
+    list[#list + 1] = group
   end
-  table.sort(list, function(a, b) return a.count > b.count end)
+  table.sort(list, function(a, b)
+    if a.count ~= b.count then
+      return a.count > b.count
+    end
+    return a.entity < b.entity
+  end)
   return util.ok({
     area = { x = x, y = y, radius = radius },
     surface = surface.name,
-    distinct = total,
-    entities = list,
-    uncharted_entities_nearby = hidden
+    charted = true,
+    visible = util.is_visible(force, surface, center),
+    distinct = #list,
+    entities = list
   })
 end
 
-function world.find(spec)
-  spec = spec or {}
-  local surface = surface_by_name(spec.surface)
+function world.find(spec, player)
+  if not campaign.has("radar_vision") then
+    return util.err("capability_locked:radar_vision")
+  end
+  spec = type(spec) == "table" and spec or {}
+  player = get_player(player)
+  local surface = surface_by_name(spec.surface, player)
   if not surface then
     return util.err("no such surface")
   end
   local force = safe_force()
-  local origin = spec.near or (game.get_player(1) and game.get_player(1).position) or { x = 0, y = 0 }
-  local radius = math.min(spec.radius or 512, 2048)
-  local matches = surface.find_entities_filtered({
-    name = spec.name,
-    type = spec.type,
-    area = { { origin.x - radius, origin.y - radius }, { origin.x + radius, origin.y + radius } },
-    limit = 500
-  })
-  local results = {}
-  for _, ent in ipairs(matches) do
-    if ent.valid and util.can_see(force, surface, ent.position) then
-      local d = math.sqrt((ent.position.x - origin.x) ^ 2 + (ent.position.y - origin.y) ^ 2)
-      results[#results + 1] = {
-        name = ent.name,
-        position = { x = util.round(ent.position.x, 1), y = util.round(ent.position.y, 1) },
-        distance = util.round(d, 1),
-        status = ent.status and tostring(ent.status) or nil
-      }
-    end
+  if not force then
+    return util.err("no player force")
   end
-  table.sort(results, function(a, b) return a.distance < b.distance end)
-  while #results > 25 do
+
+  local origin = player and player.position or { x = 0, y = 0 }
+  if type(spec.near) == "table" and numeric(spec.near.x) and numeric(spec.near.y) then
+    origin = { x = numeric(spec.near.x), y = numeric(spec.near.y) }
+  end
+  local radius = bounded_radius(spec.radius, 512, 2048)
+  local ok_matches, matches = pcall(function()
+    return surface.find_entities_filtered({
+      name = spec.name,
+      type = spec.type,
+      area = { { origin.x - radius, origin.y - radius }, { origin.x + radius, origin.y + radius } },
+      limit = 500
+    })
+  end)
+  if not ok_matches then
+    return util.err("invalid entity query")
+  end
+
+  local results = {}
+  for _, entity in ipairs(world.filter_visible_entities(matches or {}, force, surface, 500)) do
+    local distance = math.sqrt((entity.x - origin.x) ^ 2 + (entity.y - origin.y) ^ 2)
+    results[#results + 1] = {
+      name = entity.name,
+      type = entity.type,
+      position = { x = entity.x, y = entity.y },
+      distance = util.round(distance, 1)
+    }
+  end
+  table.sort(results, function(a, b)
+    if a.distance ~= b.distance then
+      return a.distance < b.distance
+    end
+    return a.name < b.name
+  end)
+  while #results > MAX_VISIBLE_ENTITIES do
     table.remove(results)
   end
-  return util.ok({ query = { name = spec.name, near = origin, radius = radius }, matches = results, visible_only = true })
+  return util.ok({
+    query = { name = spec.name, near = origin, radius = radius },
+    matches = results,
+    visible_only = true
+  })
 end
 
-function world.entity_at(surface_name, x, y)
-  local surface = surface_by_name(surface_name)
+function world.entity_at(surface_name, x, y, player)
+  if not campaign.has("radar_vision") then
+    return util.err("capability_locked:radar_vision")
+  end
+  x, y = numeric(x), numeric(y)
+  if not x or not y then
+    return util.err("invalid position")
+  end
+  player = get_player(player)
+  local surface = surface_by_name(surface_name, player)
   if not surface then
     return util.err("no such surface")
   end
   local force = safe_force()
-  if not util.can_see(force, surface, { x = x, y = y }) then
-    return util.ok({ visible = false, note = "fog of war" })
+  if not force then
+    return util.err("no player force")
   end
-  local ents = surface.find_entities({ { x - 0.6, y - 0.6 }, { x + 0.6, y + 0.6 } })
-  local out = {}
-  for _, ent in ipairs(ents) do
-    if ent.valid then
-      local e = {
-        name = ent.name,
-        type = ent.type,
-        position = { x = util.round(ent.position.x, 2), y = util.round(ent.position.y, 2) },
-        unit_number = ent.unit_number,
-        force = ent.force.name
-      }
-      if ent.recipe then
-        e.recipe = ent.recipe.name
-      end
-      if ent.crafting_progress then
-        e.crafting_progress = util.round(ent.crafting_progress, 2)
-      end
-      if ent.status then
-        e.status = tostring(ent.status)
-      end
-      if ent.energy then
-        e.energy = util.round(ent.energy, 0)
-      end
-      local inv = ent.get_inventory and ent.get_inventory(defines.inventory.chest) or nil
-      if inv and inv.valid then
-        local c = inv.get_contents()
-        local lines = {}
-        for n, cnt in pairs(c) do
-          lines[#lines + 1] = n .. ":" .. cnt
-        end
-        table.sort(lines)
-        e.contents = lines
-      end
-      out[#out + 1] = e
-    end
-  end
-  return util.ok({ at = { x = x, y = y }, entities = out })
-end
 
-function world.charted_bounds(surface_name)
-  local surface = surface_by_name(surface_name)
-  if not surface then
-    return util.err("bad surface")
+  local at = { x = x, y = y }
+  local ok_charted, charted = pcall(function() return util.is_charted(force, surface, at) end)
+  if not ok_charted or not charted then
+    return util.ok({ surface = surface.name, at = at, charted = false, visible = false, entities = {} })
   end
-  local force = safe_force()
-  local minx, miny, maxx, maxy = math.huge, math.huge, -math.huge, -math.huge
-  local cx, cy = util.pos_to_chunk(game.get_player(1).position).x, util.pos_to_chunk(game.get_player(1).position).y
-  for dx = -64, 64, 4 do
-    for dy = -64, 64, 4 do
-      local cp = { x = cx + dx, y = cy + dy }
-      if force.is_chunk_charted(surface, cp) then
-        local tx, ty = cp.x * 32, cp.y * 32
-        if tx < minx then minx = tx end
-        if ty < miny then miny = ty end
-        if tx > maxx then maxx = tx end
-        if ty > maxy then maxy = ty end
-      end
-    end
+
+  local ok_entities, entities = pcall(function()
+    return surface.find_entities({ { x - 0.6, y - 0.6 }, { x + 0.6, y + 0.6 } })
+  end)
+  if not ok_entities then
+    return util.err("unable to inspect entity position")
   end
-  if minx == math.huge then
-    return util.ok({ charted = false })
+
+  local out = {}
+  for _, entity in ipairs(world.filter_visible_entities(entities or {}, force, surface, 100)) do
+    out[#out + 1] = {
+      name = entity.name,
+      type = entity.type,
+      position = { x = entity.x, y = entity.y }
+    }
   end
-  return util.ok({ charted = true, approx_bounds = { min_x = minx, min_y = miny, max_x = maxx, max_y = maxy }, sampled_radius_chunks = 256 })
+  return util.ok({
+    surface = surface.name,
+    at = at,
+    charted = true,
+    visible = util.is_visible(force, surface, at),
+    entities = out
+  })
 end
 
 return world

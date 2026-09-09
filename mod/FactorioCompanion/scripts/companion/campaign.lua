@@ -4,6 +4,12 @@ local campaign = {}
 
 storage = storage or {}
 
+-- This is deliberately runtime-only.  A save reload can rewind every value in
+-- storage, so it must never be used as the canonical conversation head.  It
+-- only namespaces tentative client turn/request references until the daemon
+-- returns the authoritative completed turn id in assistant_end.
+local runtime_session_id
+
 -- Standard capability presets for milestone convenience
 local PRESETS = {
   [0] = { "telemetry" },
@@ -21,11 +27,30 @@ local function generate_uuid()
     if rng then
       v = (c == "x") and rng(0, 15) or (rng(8, 11))
     else
-      local r = math.floor((game.tick * 31 + math.random(0, 255)) % 16)
+      local tick = (game and game.tick) or 0
+      local r = math.floor((tick * 31 + math.random(0, 255)) % 16)
       v = (c == "x") and r or ((r % 4) + 8)
     end
     return string.format("%x", v)
   end)
+end
+
+local function get_runtime_session_id()
+  if not runtime_session_id then
+    runtime_session_id = generate_uuid()
+  end
+  return runtime_session_id
+end
+
+local function normalize_capability_key(feature_key)
+  if type(feature_key) ~= "string" then
+    return nil
+  end
+  local key = string.match(feature_key, "^%s*(.-)%s*$")
+  if key == "" or #key > 80 then
+    return nil
+  end
+  return key
 end
 
 function campaign.ensure_storage()
@@ -35,13 +60,22 @@ function campaign.ensure_storage()
     util.log("generated new companion world_id: " .. storage.companion.world_id)
   end
   storage.companion.conversation_head = storage.companion.conversation_head or "turn_0"
-  storage.companion.turn_counter = storage.companion.turn_counter or 0
-  storage.companion.capabilities = storage.companion.capabilities or {
-    telemetry = true,
-    research = true,
-    inventory = true
-  }
-  storage.companion.level = storage.companion.level or 2
+  if type(storage.companion.turn_counter) ~= "number" then
+    storage.companion.turn_counter = 0
+  end
+  if type(storage.companion.request_counter) ~= "number" then
+    storage.companion.request_counter = 0
+  end
+  if type(storage.companion.capabilities) ~= "table" then
+    storage.companion.capabilities = {
+      telemetry = true,
+      research = true,
+      inventory = true
+    }
+  end
+  if type(storage.companion.level) ~= "number" then
+    storage.companion.level = 2
+  end
 end
 
 function campaign.get_world_id()
@@ -56,39 +90,58 @@ end
 
 function campaign.set_conversation_head(turn_id)
   campaign.ensure_storage()
-  storage.companion.conversation_head = tostring(turn_id)
+  if type(turn_id) ~= "string" or turn_id == "" or #turn_id > 200 then
+    return false, "invalid conversation head"
+  end
+  storage.companion.conversation_head = turn_id
+  return true
 end
 
 function campaign.next_turn_id()
   campaign.ensure_storage()
   storage.companion.turn_counter = storage.companion.turn_counter + 1
-  return "turn_" .. tostring(storage.companion.turn_counter)
+  -- The daemon must treat this as a client reference, not as the canonical
+  -- completed turn id.  Including a runtime namespace prevents the common
+  -- turn_13 collision when a save is rolled back and a new branch is created.
+  return "client-turn-" .. campaign.get_world_id() .. "-" .. get_runtime_session_id() .. "-" .. tostring(storage.companion.turn_counter)
+end
+
+function campaign.next_request_id()
+  campaign.ensure_storage()
+  storage.companion.request_counter = storage.companion.request_counter + 1
+  return "request-" .. campaign.get_world_id() .. "-" .. get_runtime_session_id() .. "-" .. tostring(storage.companion.request_counter)
+end
+
+function campaign.get_runtime_session_id()
+  return get_runtime_session_id()
 end
 
 function campaign.has(feature_key)
   campaign.ensure_storage()
-  return storage.companion.capabilities[tostring(feature_key)] == true
+  local key = normalize_capability_key(feature_key)
+  return key ~= nil and storage.companion.capabilities[key] == true
 end
 
 function campaign.unlock(feature_key)
   campaign.ensure_storage()
-  local key = tostring(feature_key)
+  local key = normalize_capability_key(feature_key)
+  if not key then
+    return false, "invalid capability key"
+  end
   local was = storage.companion.capabilities[key] == true
   storage.companion.capabilities[key] = true
   if not was then
     util.log("unlocked companion capability: " .. key)
-    script.raise_event(defines.events.on_lua_shortcut or defines.events.on_tick, {
-      name = "companion_capability_changed",
-      capability = key,
-      unlocked = true
-    })
   end
   return not was
 end
 
 function campaign.lock(feature_key)
   campaign.ensure_storage()
-  local key = tostring(feature_key)
+  local key = normalize_capability_key(feature_key)
+  if not key then
+    return false, "invalid capability key"
+  end
   local was = storage.companion.capabilities[key] == true
   storage.companion.capabilities[key] = nil
   if was then
@@ -111,7 +164,8 @@ end
 
 function campaign.set_level(level)
   campaign.ensure_storage()
-  level = math.max(0, math.min(tonumber(level) or 0, 4))
+  level = math.floor(tonumber(level) or 0)
+  level = math.max(0, math.min(level, 4))
   storage.companion.level = level
   local preset = PRESETS[level] or PRESETS[0]
   storage.companion.capabilities = {}
@@ -125,6 +179,17 @@ end
 function campaign.get_level()
   campaign.ensure_storage()
   return storage.companion.level or 0
+end
+
+-- Small campaign-facing API.  Campaign code can use this without knowing
+-- anything about UDP, UI state, or the model provider.
+function campaign.capability_state()
+  return {
+    world_id = campaign.get_world_id(),
+    conversation_head = campaign.get_conversation_head(),
+    capabilities = campaign.get_capabilities(),
+    level = campaign.get_level()
+  }
 end
 
 return campaign

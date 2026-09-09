@@ -1,72 +1,87 @@
-# Factorio AI Companion UDP Protocol Specification (v1)
+# Factorio Companion UDP protocol v1
 
-This document defines the lightweight, versioned UDP protocol between the **Factorio Companion Mod** and the **Companion Daemon**.
+This is the wire contract between the `FactorioCompanion` mod and
+`python -m bridge.daemon`. It is a local single-player transport: packets are
+UTF-8 JSON datagrams sent over loopback UDP.
 
----
+## Transport
 
-## 1. Transport & Addressing
+| Endpoint | Default | Role |
+| --- | ---: | --- |
+| Factorio UDP receive port | `34199` | enabled by Factorio's `--enable-lua-udp=34199` launch option |
+| Daemon UDP listen port | `34200` | receives `hello`, `heartbeat`, and `user_message` |
 
-- **Medium**: Localhost UDP (`127.0.0.1`).
-- **Factorio Listening Port**: Default `34199` (configured via Factorio CLI `--enable-lua-udp 34199`).
-- **Companion Daemon Listening Port**: Default `34200`.
-- **Packet Encoding**: UTF-8 JSON datagrams.
-- **Maximum Datagram Size**: 4096 bytes (safe below OS MTU and well within Factorio's 256KB socket buffer).
+The mod sends with Factorio's native `helpers.send_udp` to the daemon port.
+The daemon sends replies to the source address and port of the received
+datagram, so it does not need a second fixed Factorio destination port.
+Both sides reject a datagram larger than **4096 UTF-8 bytes**. The payload must
+fit in one datagram; there is no fragmentation protocol.
 
----
+The daemon binds to loopback by default and rejects non-loopback senders. Keep
+the mod and daemon on the same machine for v1.
 
-## 2. Common Envelope Format
+## Envelope
 
-Every packet exchanged over UDP contains a standard envelope:
+Every datagram has this compact JSON shape:
 
 ```json
 {
   "v": 1,
-  "type": "<message_type>",
-  "exchange_id": "<string>",
-  "seq": 0,
+  "type": "user_message",
+  "exchange_id": "ex-request-world-a-session-1",
+  "seq": 1,
   "tick": 12345,
   "payload": {}
 }
 ```
 
-- `v` (uint): Protocol version, currently `1`.
-- `type` (string): Discriminator string.
-- `exchange_id` (string): Unique ID for the conversational exchange (`"ex_<world_id>_<turn_id>"`), or empty for session-level control (`hello`, `heartbeat`).
-- `seq` (uint): Monotonically increasing sequence number per exchange.
-- `tick` (uint): Current Factorio game tick when sent.
-- `payload` (object): Message-specific data payload.
+Fields:
 
----
+- `v`: required integer protocol version, currently `1`.
+- `type`: one of `hello`, `hello_ack`, `heartbeat`, `user_message`,
+  `assistant_start`, `assistant_delta`, `assistant_end`, or `error`.
+- `exchange_id`: empty for session control; non-empty for an exchange.
+- `seq`: non-negative integer. Control sequences and exchange sequences are
+  monotonic from the sender's perspective; the receiver discards stale
+  exchange packets.
+- `tick`: non-negative Factorio tick when known. The daemon uses `0` because
+  it does not own the simulation clock.
+- `payload`: JSON object.
 
-## 3. Reliability & Streaming Philosophy
+Malformed JSON, invalid UTF-8, unsupported versions/types, non-integer sequence
+or tick fields, wrong payload types, and over-budget packets are dropped
+without raising out of either receive loop. The daemon additionally validates
+required fields for each message type before touching the session store or
+provider.
 
-1. **Lightweight Reliability without TCP Emulation**:
-   - Factorio turns incoming UDP into deterministic game engine input actions. We deliberately avoid per-delta ACKs or retransmissions to prevent flooding the engine's input closure.
-   - Sequence numbers allow the receiver to discard duplicate or out-of-order packets.
-2. **Authoritative Completion**:
-   - `assistant_delta` delivers incremental text for cosmetic live streaming in the GUI.
-   - If a transient delta packet is dropped or arrives late, `assistant_end` delivers the complete, authoritative `full_text`. The UI reconciles to `full_text` upon completion.
-3. **Streaming Cadence**:
-   - The daemon buffers LLM tokens and emits `assistant_delta` at an interval of ~80–150ms or ~20–40 characters per packet. This guarantees fluid visual feedback (8–12 FPS typing) while keeping UDP traffic minimal.
+## Identity and persistence
 
----
+The IDs have different ownership and lifetimes:
 
-## 4. Save Rollback & Timeline Branching
+| Field | Owner | Lifetime/meaning |
+| --- | --- | --- |
+| `world_id` | Factorio save | Persisted save identity. The daemon uses it to isolate timelines. |
+| `conversation_head` | Factorio save | Persisted completed head; `turn_0` is the virtual root. |
+| `client_session_id` | Factorio runtime | Fresh runtime connection identity; not trusted as durable history. |
+| `request_id` | Factorio runtime | Unique request reference for one submitted message. |
+| `turn_id` / `client_turn_id` | Factorio runtime | Provisional client reference; may rewind with a save. |
+| `turn_id` in `assistant_end` | daemon | Canonical `turn_<random>` ID, globally unique in SQLite. |
+| `parent_turn_id` | daemon/session | Completed ancestor used to build the active branch. |
+| `daemon_session_id` | daemon process | New generation identity on every daemon process start. |
+| `exchange_id` | Factorio | Request transport key, normally `ex-` followed by `request_id`. |
 
-To prevent "remembering the future" when a player reloads an earlier save:
-- **`world_id`**: A UUID generated when a save game is initialized and stored authoritatively in the Factorio save file (`storage.companion.world_id`).
-- **`conversation_head`**: The ID of the latest completed conversation turn stored authoritatively in the Factorio save (`storage.companion.conversation_head`).
-- Every conversation turn is a node in a directed acyclic tree maintained by the daemon:
-  - Node contains: `turn_id`, `parent_turn_id`, `user_text`, `assistant_text`, `context_snapshot`, `timestamp`.
-- When Factorio connects or reloads a save, it announces `(world_id, conversation_head)`.
-- If `conversation_head` points to an ancestor node (because the player reloaded an older save), the daemon branches from that ancestor. Future turns recorded after that point in previous timelines are preserved in the tree but excluded from the active conversational history.
+Factorio stores only the canonical `assistant_end.turn_id` as its next
+`conversation_head`. A repeated provisional client ID can therefore never
+overwrite a prior daemon turn. The SQLite store keeps completed turns as a
+parent-linked DAG; changing the save head to an ancestor creates a future fork
+without deleting descendants. Pending and aborted turns are not included in
+model history.
 
----
+## Message types
 
-## 5. Message Types
+### `hello` — mod → daemon
 
-### 5.1 `hello` (Mod → Daemon)
-Initiated on game load, unpause, or reconnect to handshake and synchronize state.
+Sent after player join, save reload, or reconnect.
 
 ```json
 {
@@ -78,16 +93,21 @@ Initiated on game load, unpause, or reconnect to handshake and synchronize state
   "payload": {
     "mod_version": "0.2.0",
     "factorio_version": "2.0",
-    "world_id": "550e8400-e29b-41d4-a716-446655440000",
-    "conversation_head": "turn_12",
+    "world_id": "world-uuid",
+    "conversation_head": "turn_0",
     "player_name": "engineer",
-    "capabilities": ["telemetry", "research", "inventory"]
+    "capabilities": ["inventory", "research", "telemetry"],
+    "client_session_id": "client-session-uuid"
   }
 }
 ```
 
-### 5.2 `hello_ack` (Daemon → Mod)
-Daemon acknowledgment of handshake.
+`world_id`, `conversation_head`, and `capabilities` are required by the v1
+mod. The other fields are descriptive or identity metadata.
+
+### `hello_ack` — daemon → mod
+
+Acknowledges the save identity and reports the daemon generation.
 
 ```json
 {
@@ -95,149 +115,217 @@ Daemon acknowledgment of handshake.
   "type": "hello_ack",
   "exchange_id": "",
   "seq": 1,
-  "tick": 600,
+  "tick": 0,
   "payload": {
     "daemon_version": "0.2.0",
-    "model": "hermes-3-llama-3.1-8b",
-    "active_world_id": "550e8400-e29b-41d4-a716-446655440000",
-    "active_turn_id": "turn_12",
-    "history_depth": 12,
-    "status": "ready"
+    "model": "local-model",
+    "world_id": "world-uuid",
+    "active_world_id": "world-uuid",
+    "active_turn_id": "turn_0",
+    "history_depth": 0,
+    "status": "ready",
+    "client_session_id": "client-session-uuid",
+    "daemon_session_id": "daemon-process-uuid"
   }
 }
 ```
 
-### 5.3 `heartbeat` (Mod ⇄ Daemon)
-Exchanged every 60–180 ticks to maintain connection liveness and track latency.
+The mod accepts the acknowledgement only for its current world and runtime
+session. A changed `daemon_session_id` cancels any old in-game stream before
+the new generation is accepted.
+
+### `heartbeat` — mod ⇄ daemon
+
+Control traffic is exchanged roughly every two seconds while a player is
+connected, including during model inference.
 
 ```json
 {
   "v": 1,
   "type": "heartbeat",
   "exchange_id": "",
-  "seq": 45,
-  "tick": 2700,
+  "seq": 12,
+  "tick": 720,
   "payload": {
-    "ping_tick": 2700,
-    "state": "ready"
+    "ping_tick": 720,
+    "state": "streaming",
+    "world_id": "world-uuid",
+    "client_session_id": "client-session-uuid",
+    "daemon_session_id": "daemon-process-uuid"
   }
 }
 ```
 
-### 5.4 `user_message` (Mod → Daemon)
-Dispatched when the player submits a message in the companion GUI. Includes an explicit grounded context snapshot for this turn.
+The daemon answers with its current `state` (`ready` or `busy`) and generation
+identity. Heartbeats are liveness signals, not acknowledgements for individual
+model deltas. If the mod receives no packets within its timeout window, it
+returns to `offline`, clears its active exchange, and retries `hello`.
+
+### `user_message` — mod → daemon
+
+The message contains the complete, capability-gated context snapshot for this
+turn. The daemon rebuilds model history from the submitted parent and the
+completed SQLite ancestor chain.
 
 ```json
 {
   "v": 1,
   "type": "user_message",
-  "exchange_id": "ex_turn_13",
+  "exchange_id": "ex-request-world-uuid-client-session-1",
   "seq": 1,
   "tick": 3600,
   "payload": {
-    "turn_id": "turn_13",
-    "parent_turn_id": "turn_12",
-    "world_id": "550e8400-e29b-41d4-a716-446655440000",
-    "text": "What are we researching right now and do we have enough copper plates?",
+    "request_id": "request-world-uuid-client-session-1",
+    "client_session_id": "client-session-uuid",
+    "turn_id": "client-turn-world-uuid-client-session-1",
+    "client_turn_id": "client-turn-world-uuid-client-session-1",
+    "parent_turn_id": "turn_0",
+    "world_id": "world-uuid",
+    "text": "What are we researching right now?",
     "context": {
+      "capabilities": ["research", "telemetry"],
       "player": {
         "name": "engineer",
-        "position": { "x": 12.5, "y": -4.2 },
         "surface": "nauvis",
-        "health": 250.0,
-        "max_health": 250.0,
-        "walking": false,
-        "vehicle": null
+        "position": {"x": 12.5, "y": -4.2}
       },
-      "capabilities": ["telemetry", "research", "inventory"],
       "research": {
         "current": "steel-processing",
         "progress": 0.42,
-        "queue": ["oil-processing"],
+        "queue": [{"tech": "oil-processing"}],
         "unlocked_count": 14
-      },
-      "inventory": {
-        "copper-plate": 142,
-        "iron-plate": 87,
-        "electronic-circuit": 34
-      },
-      "visible_perception": {
-        "nearby_entities": [
-          { "name": "iron-chest", "x": 10, "y": -5, "contents": { "iron-plate": 200 } }
-        ],
-        "active_alerts": []
-      },
-      "charted_knowledge": {
-        "discovered_bounds": { "min_x": -160, "min_y": -160, "max_x": 160, "max_y": 160 }
       }
     }
   }
 }
 ```
 
-### 5.5 `assistant_start` (Daemon → Mod)
-Notifies the mod that the LLM has accepted the prompt and generation has begun. Transitions UI to `thinking` / `streaming`.
+The context is model input, not an authorization token. Its fields are
+constructed by the mod's capability-gated builder. Dynamic perception is
+limited to entities and alerts that are both charted and currently visible;
+charted map data is static sampled bounds only. The model does not receive
+transport IDs, hidden entities/resources, production/power internals, or enemy
+evolution state through this context.
+
+### `assistant_start` — daemon → mod
+
+Marks the beginning of a generation. Sequence `1` is reserved for this packet.
 
 ```json
 {
   "v": 1,
   "type": "assistant_start",
-  "exchange_id": "ex_turn_13",
+  "exchange_id": "ex-request-world-uuid-client-session-1",
   "seq": 1,
-  "tick": 3615,
+  "tick": 0,
   "payload": {
-    "model": "hermes-3-llama-3.1-8b"
+    "world_id": "world-uuid",
+    "model": "local-model",
+    "request_id": "request-world-uuid-client-session-1",
+    "request_turn_id": "client-turn-world-uuid-client-session-1",
+    "client_session_id": "client-session-uuid",
+    "daemon_session_id": "daemon-process-uuid"
   }
 }
 ```
 
-### 5.6 `assistant_delta` (Daemon → Mod)
-Incremental text chunk for live GUI typing effect.
+### `assistant_delta` — daemon → mod
+
+Cosmetic streamed text. Each packet is independently discardable and is kept
+well below the datagram budget by the daemon's delta batcher.
 
 ```json
 {
   "v": 1,
   "type": "assistant_delta",
-  "exchange_id": "ex_turn_13",
+  "exchange_id": "ex-request-world-uuid-client-session-1",
   "seq": 2,
-  "tick": 3625,
+  "tick": 0,
   "payload": {
-    "delta": "We're currently 42% through Steel Processing."
+    "world_id": "world-uuid",
+    "request_id": "request-world-uuid-client-session-1",
+    "request_turn_id": "client-turn-world-uuid-client-session-1",
+    "delta": "Steel Processing is at 42%.",
+    "client_session_id": "client-session-uuid",
+    "daemon_session_id": "daemon-process-uuid"
   }
 }
 ```
 
-### 5.7 `assistant_end` (Daemon → Mod)
-Signals completion of the exchange. Supplies authoritative final text and updates the persistent conversation head.
+### `assistant_end` — daemon → mod
+
+The only successful completion signal. The daemon preflights this packet's
+size, atomically commits the pending SQLite turn and head, then sends it. The
+mod treats `full_text` as authoritative even if deltas were lost, duplicated,
+or reordered.
 
 ```json
 {
   "v": 1,
   "type": "assistant_end",
-  "exchange_id": "ex_turn_13",
-  "seq": 7,
-  "tick": 3680,
+  "exchange_id": "ex-request-world-uuid-client-session-1",
+  "seq": 3,
+  "tick": 0,
   "payload": {
-    "turn_id": "turn_13",
-    "full_text": "We're currently 42% through Steel Processing. In your inventory, you have 142 copper plates, which should be plenty for basic crafting.",
-    "duration_ms": 1150
+    "world_id": "world-uuid",
+    "turn_id": "turn_0123456789abcdef0123456789abcdef",
+    "request_turn_id": "client-turn-world-uuid-client-session-1",
+    "request_id": "request-world-uuid-client-session-1",
+    "parent_turn_id": "turn_0",
+    "full_text": "Steel Processing is at 42%.",
+    "duration_ms": 1150,
+    "client_session_id": "client-session-uuid",
+    "daemon_session_id": "daemon-process-uuid"
   }
 }
 ```
 
-### 5.8 `error` (Daemon → Mod / Mod → Daemon)
-Signals a processing, timeout, or model failure. Clears generation state and displays the error in-game.
+The daemon-issued `turn_id` is the value the mod saves as its next
+`conversation_head`.
+
+### `error` — daemon → mod
+
+Errors are request-scoped when `exchange_id` is non-empty. A request error
+includes the same `world_id`, `request_id`, `request_turn_id`, client session,
+and daemon generation fields as the stream, allowing the mod to reject stale
+errors safely.
 
 ```json
 {
   "v": 1,
   "type": "error",
-  "exchange_id": "ex_turn_13",
-  "seq": 8,
-  "tick": 3700,
+  "exchange_id": "ex-request-world-uuid-client-session-1",
+  "seq": 2,
+  "tick": 0,
   "payload": {
     "code": "MODEL_TIMEOUT",
-    "message": "LLM request timed out after 30 seconds."
+    "message": "The model request timed out.",
+    "world_id": "world-uuid",
+    "request_id": "request-world-uuid-client-session-1",
+    "request_turn_id": "client-turn-world-uuid-client-session-1",
+    "client_session_id": "client-session-uuid",
+    "daemon_session_id": "daemon-process-uuid"
   }
 }
 ```
+
+Common codes include `BUSY`, `STALE_HEAD`, `STALE_SESSION`, `MODEL_HTTP`,
+`MODEL_TIMEOUT`, `MODEL_STREAM`, `MODEL_EMPTY`, `MODEL_TOO_LARGE`, and
+`DAEMON_ERROR`. The pending turn is marked aborted on a handled request
+failure; the saved head does not advance.
+
+## Ordering, reconnect, and duplicate policy
+
+- A mod accepts assistant packets only for its active `exchange_id`, current
+  `world_id`, current `client_session_id`, matching `request_id`/provisional
+  turn, and current `daemon_session_id`.
+- For an active exchange, a packet with `seq` less than or equal to the last
+  accepted sequence is ignored. There are no per-delta acknowledgements or
+  retransmissions.
+- A duplicated `user_message` with the same fingerprint does not start a
+  second model call. A completed exchange is cached briefly so the daemon can
+  replay the authoritative `assistant_end` using its original final sequence.
+- If a daemon or Factorio runtime generation changes, the old active request is
+  cancelled and its pending row cannot enter history.
+- One exchange may run per world. Independent worlds may use up to the daemon's
+  configured worker limit.
