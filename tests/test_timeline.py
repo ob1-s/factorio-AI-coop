@@ -66,6 +66,31 @@ class TimelineTests(unittest.TestCase):
         self.assertIn("steel-processing", messages[-1]["content"])
         self.assertIn("工場長", messages[-1]["content"])
 
+    def test_build_llm_messages_respects_the_requested_history_limit(self) -> None:
+        manager = SessionManager()
+        world = manager.get_or_create_world("world-a")
+        add_completed(world, "a", "turn_0", "A", "A!")
+        add_completed(world, "b", "a", "B", "B!")
+        add_completed(world, "c", "b", "C", "C!")
+
+        messages = manager.build_llm_messages(
+            "world-a",
+            "c",
+            "current",
+            max_turns=2,
+        )
+
+        self.assertEqual(
+            history_text(messages),
+            [
+                ("user", "B"),
+                ("assistant", "B!"),
+                ("user", "C"),
+                ("assistant", "C!"),
+                ("user", "current"),
+            ],
+        )
+
     def test_fork_from_ancestor_keeps_both_histories(self) -> None:
         manager = SessionManager()
         world = manager.get_or_create_world("world-a")

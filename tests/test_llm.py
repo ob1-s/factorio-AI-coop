@@ -53,6 +53,16 @@ class OpenAiCompatibleTests(unittest.TestCase):
 
         self.assertIn("HTTP 503", str(raised.exception))
 
+    def test_incomplete_sse_stream_is_reported_as_partial(self) -> None:
+        with FakeLlmServer(
+            [FakeResponse(text="partial answer", chunks=("partial answer",), send_done=False)]
+        ) as fake:
+            client = OpenAICompatibleClient(base_url=fake.base_url, model="fake-model")
+            with self.assertRaises(LLMError) as raised:
+                client.stream([], model="fake-model")
+
+        self.assertEqual(raised.exception.code, "MODEL_STREAM")
+
     def test_non_streaming_completion_is_supported_for_fallbacks(self) -> None:
         with FakeLlmServer(
             [FakeResponse(text="  final answer  ", stream=False)]

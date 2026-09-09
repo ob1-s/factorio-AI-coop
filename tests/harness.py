@@ -48,6 +48,7 @@ class FakeResponse:
     delay_before: float = 0.0
     delay_between: float = 0.0
     stream: bool = True
+    send_done: bool = True
 
     def resolved_chunks(self) -> tuple[str, ...]:
         if self.chunks is not None:
@@ -124,11 +125,12 @@ class _FakeLlmHandler(BaseHTTPRequestHandler):
                 return
             if plan.delay_between:
                 time.sleep(plan.delay_between)
-        try:
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            return
+        if plan.send_done:
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
 
 class FakeLlmServer:
@@ -415,12 +417,14 @@ class DaemonProcess:
         llm_base_url: str,
         db_path: Path,
         model: str = "fake-model",
+        delta_chars: int | None = None,
     ) -> None:
         self.port = port
         self.llm_base_url = llm_base_url
         self.db_path = db_path
         self.model = model
         self.process: subprocess.Popen[str] | None = None
+        self.delta_chars = delta_chars
         self.output: list[str] = []
         self._reader: threading.Thread | None = None
         self._bound_port: int | None = None
@@ -450,26 +454,29 @@ class DaemonProcess:
                 "for Workstream E integration tests"
             )
         env = self._environment()
+        command = [
+            sys.executable,
+            "-m",
+            "bridge.daemon",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.port),
+            "--base-url",
+            self.llm_base_url,
+            "--model",
+            self.model,
+            "--api-key",
+            "test-key",
+            "--timeout",
+            "2",
+            "--log-level",
+            "DEBUG",
+        ]
+        if self.delta_chars is not None:
+            command.extend(["--delta-chars", str(self.delta_chars)])
         self.process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "bridge.daemon",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.port),
-                "--base-url",
-                self.llm_base_url,
-                "--model",
-                self.model,
-                "--api-key",
-                "test-key",
-                "--timeout",
-                "2",
-                "--log-level",
-                "DEBUG",
-            ],
+            command,
             cwd=REPO_ROOT,
             env=env,
             stdin=subprocess.DEVNULL,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import unittest
 
+from bridge import protocol
 from bridge.daemon import DeltaBatcher
 from tests.harness import (
     CosmeticStream,
@@ -70,6 +71,9 @@ class DaemonIntegrationTests(unittest.TestCase):
             port=0,
             llm_base_url=self.llm.base_url,
             db_path=self._db_path(),
+            # Exercise the daemon's packet-size splitter even when a provider
+            # hands it one very large stream chunk.
+            delta_chars=10_000,
         )
         try:
             self.daemon.start()
@@ -175,6 +179,7 @@ class DaemonIntegrationTests(unittest.TestCase):
         error = self.peer.wait_for_type("error", exchange_id=exchange)
 
         self.assertTrue(error["payload"].get("message") or error["payload"].get("code"))
+        self.assertEqual(error["payload"].get("request_id"), "request_turn-error")
         self.assertFalse(
             any(
                 packet.get("type") == "assistant_end"
@@ -183,6 +188,59 @@ class DaemonIntegrationTests(unittest.TestCase):
             )
         )
         self.daemon.assert_running()
+
+    def test_oversized_authoritative_completion_is_rejected_before_commit(self) -> None:
+        self.llm.add_response(FakeResponse(text="x" * 4000, chunks=("x" * 4000,)))
+        self.handshake()
+        exchange = self.peer.user_message(
+            self.daemon.address,
+            turn_id="turn-too-large",
+            text="return a very large answer",
+        )
+        error = self.peer.wait_for_type("error", exchange_id=exchange, timeout=5.0)
+
+        self.assertEqual(error["payload"].get("code"), "MODEL_TOO_LARGE")
+        self.assertEqual(error["payload"].get("request_id"), "request_turn-too-large")
+        deltas = [
+            packet
+            for packet in self.peer.received
+            if packet.get("type") == "assistant_delta"
+            and packet.get("exchange_id") == exchange
+        ]
+        self.assertTrue(deltas)
+        for packet in deltas:
+            wire = protocol.create_packet(
+                packet["type"],
+                packet["exchange_id"],
+                packet["seq"],
+                packet["payload"],
+            )
+            self.assertLessEqual(len(wire.encode("utf-8")), protocol.MAX_DATAGRAM_BYTES)
+        self.assertFalse(
+            any(
+                packet.get("type") == "assistant_end"
+                and packet.get("exchange_id") == exchange
+                for packet in self.peer.received
+            )
+        )
+        self.daemon.assert_running()
+
+    def test_request_rejection_error_preserves_factorio_correlation(self) -> None:
+        self.handshake()
+        exchange = self.peer.user_message(
+            self.daemon.address,
+            turn_id="turn-context-error",
+            text="this context is not for this world",
+            context={"world_id": "different-world"},
+        )
+        error = self.peer.wait_for_type("error", exchange_id=exchange)
+
+        self.assertEqual(error["payload"].get("code"), "WORLD_MISMATCH")
+        self.assertEqual(error["payload"].get("world_id"), "world-a")
+        self.assertEqual(error["payload"].get("request_id"), "request_turn-context-error")
+        self.assertEqual(error["payload"].get("request_turn_id"), "turn-context-error")
+        self.assertEqual(error["payload"].get("client_session_id"), "client-test-session")
+        self.assertTrue(error["payload"].get("daemon_session_id"))
 
     def test_malformed_packets_do_not_kill_daemon_or_block_reconnect(self) -> None:
         self.peer.send_raw(self.daemon.address, b"{ definitely not json")
