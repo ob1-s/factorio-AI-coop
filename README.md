@@ -67,9 +67,9 @@ oversized completion.
 
 ## What is persisted
 
-The Factorio save owns its `world_id` and `conversation_head`. The daemon
-stores completed turns in a SQLite DAG keyed by globally unique daemon-issued
-IDs. Factorio-generated turn IDs are retained only as client aliases, so a
+On first connection the daemon assigns a random `world_id`; Factorio then
+persists that ID and its `conversation_head` in the save. The daemon stores
+completed turns in a SQLite DAG keyed by globally unique daemon-issued IDs. Factorio-generated turn IDs are retained only as client aliases, so a
 save rollback cannot overwrite a previous branch. A reload moves the active
 head to the save's ancestor without deleting later branches; pending and
 aborted generations are excluded from model history.

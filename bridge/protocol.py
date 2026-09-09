@@ -73,13 +73,18 @@ def _validate_payload(msg_type: str, exchange_id: str, payload: Mapping[str, Any
     if msg_type == "hello":
         if exchange_id:
             raise ProtocolError("hello must not have an exchange_id")
-        _string_field(
-            payload.get("world_id"),
-            "payload.world_id",
-            required=True,
-            allow_empty=False,
-            max_length=MAX_ID_LENGTH,
-        )
+        # A brand-new Factorio save is intentionally unbound. The daemon
+        # assigns its durable world ID during the first hello and the mod then
+        # persists that ID in the save. If a world ID is supplied, validate it
+        # strictly rather than silently replacing malformed input.
+        if "world_id" in payload:
+            _string_field(
+                payload.get("world_id"),
+                "payload.world_id",
+                required=True,
+                allow_empty=False,
+                max_length=MAX_ID_LENGTH,
+            )
         _string_field(
             payload.get("conversation_head"),
             "payload.conversation_head",
@@ -107,6 +112,10 @@ def _validate_payload(msg_type: str, exchange_id: str, payload: Mapping[str, Any
                 _string_field(payload[field], f"payload.{field}", max_length=MAX_ID_LENGTH)
         if "state" in payload:
             _string_field(payload["state"], "payload.state", max_length=64)
+        if "hello_seq" in payload:
+            hello_seq = payload["hello_seq"]
+            if not _is_int(hello_seq) or hello_seq < 0:
+                raise ProtocolError("payload.hello_seq must be a non-negative integer")
 
     elif msg_type == "user_message":
         if not exchange_id:

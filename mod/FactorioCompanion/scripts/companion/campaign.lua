@@ -4,11 +4,12 @@ local campaign = {}
 
 storage = storage or {}
 
--- This is deliberately runtime-only.  A save reload can rewind every value in
--- storage, so it must never be used as the canonical conversation head.  It
--- only namespaces tentative client turn/request references until the daemon
--- returns the authoritative completed turn id in assistant_end.
+-- Runtime-only identity. Factorio simulation state is deterministic, so this
+-- value must be assigned by the external daemon during hello and must never be
+-- persisted as durable campaign state.
 local runtime_session_id
+
+local IDENTITY_SCHEMA_VERSION = 1
 
 -- Standard capability presets for milestone convenience
 local PRESETS = {
@@ -18,29 +19,6 @@ local PRESETS = {
   [3] = { "telemetry", "research", "inventory", "map_analysis" },
   [4] = { "telemetry", "research", "inventory", "radar_vision", "map_analysis", "markers", "tasks" }
 }
-
-local function generate_uuid()
-  local template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
-  local rng = game and game.create_random_generator and game.create_random_generator() or nil
-  return string.gsub(template, "[xy]", function(c)
-    local v
-    if rng then
-      v = (c == "x") and rng(0, 15) or (rng(8, 11))
-    else
-      local tick = (game and game.tick) or 0
-      local r = math.floor((tick * 31 + math.random(0, 255)) % 16)
-      v = (c == "x") and r or ((r % 4) + 8)
-    end
-    return string.format("%x", v)
-  end)
-end
-
-local function get_runtime_session_id()
-  if not runtime_session_id then
-    runtime_session_id = generate_uuid()
-  end
-  return runtime_session_id
-end
 
 local function normalize_capability_key(feature_key)
   if type(feature_key) ~= "string" then
@@ -55,10 +33,20 @@ end
 
 function campaign.ensure_storage()
   storage.companion = storage.companion or {}
-  if not storage.companion.world_id then
-    storage.companion.world_id = generate_uuid()
-    util.log("generated new companion world_id: " .. storage.companion.world_id)
+
+  -- One-time pre-v0 migration. Previous builds derived a UUID-looking value
+  -- from Factorio's deterministic map-seeded RNG, so two same-seed games could
+  -- collide and reloads could recreate runtime session IDs. Do not preserve
+  -- that value as authoritative identity.
+  if storage.companion.identity_schema_version ~= IDENTITY_SCHEMA_VERSION then
+    if storage.companion.world_id ~= nil then
+      util.log("migrating legacy deterministic companion identity; rebinding on next daemon hello")
+    end
+    storage.companion.world_id = nil
+    storage.companion.conversation_head = "turn_0"
+    storage.companion.identity_schema_version = IDENTITY_SCHEMA_VERSION
   end
+
   storage.companion.conversation_head = storage.companion.conversation_head or "turn_0"
   if type(storage.companion.turn_counter) ~= "number" then
     storage.companion.turn_counter = 0
@@ -83,6 +71,19 @@ function campaign.get_world_id()
   return storage.companion.world_id
 end
 
+function campaign.set_world_id(world_id)
+  campaign.ensure_storage()
+  if type(world_id) ~= "string" or world_id == "" or #world_id > 200 then
+    return false, "invalid world id"
+  end
+  local existing = storage.companion.world_id
+  if existing ~= nil and existing ~= world_id then
+    return false, "world id is already bound"
+  end
+  storage.companion.world_id = world_id
+  return true
+end
+
 function campaign.get_conversation_head()
   campaign.ensure_storage()
   return storage.companion.conversation_head
@@ -97,23 +98,42 @@ function campaign.set_conversation_head(turn_id)
   return true
 end
 
+function campaign.get_runtime_session_id()
+  return runtime_session_id
+end
+
+function campaign.set_runtime_session_id(session_id)
+  if type(session_id) ~= "string" or session_id == "" or #session_id > 200 then
+    return false, "invalid runtime session id"
+  end
+  runtime_session_id = session_id
+  return true
+end
+
+function campaign.clear_runtime_session_id()
+  runtime_session_id = nil
+end
+
 function campaign.next_turn_id()
   campaign.ensure_storage()
+  local world_id = campaign.get_world_id()
+  local session_id = campaign.get_runtime_session_id()
+  if not world_id or not session_id then
+    return nil
+  end
   storage.companion.turn_counter = storage.companion.turn_counter + 1
-  -- The daemon must treat this as a client reference, not as the canonical
-  -- completed turn id.  Including a runtime namespace prevents the common
-  -- turn_13 collision when a save is rolled back and a new branch is created.
-  return "client-turn-" .. campaign.get_world_id() .. "-" .. get_runtime_session_id() .. "-" .. tostring(storage.companion.turn_counter)
+  return "client-turn-" .. world_id .. "-" .. session_id .. "-" .. tostring(storage.companion.turn_counter)
 end
 
 function campaign.next_request_id()
   campaign.ensure_storage()
+  local world_id = campaign.get_world_id()
+  local session_id = campaign.get_runtime_session_id()
+  if not world_id or not session_id then
+    return nil
+  end
   storage.companion.request_counter = storage.companion.request_counter + 1
-  return "request-" .. campaign.get_world_id() .. "-" .. get_runtime_session_id() .. "-" .. tostring(storage.companion.request_counter)
-end
-
-function campaign.get_runtime_session_id()
-  return get_runtime_session_id()
+  return "request-" .. world_id .. "-" .. session_id .. "-" .. tostring(storage.companion.request_counter)
 end
 
 function campaign.has(feature_key)
@@ -181,8 +201,6 @@ function campaign.get_level()
   return storage.companion.level or 0
 end
 
--- Small campaign-facing API.  Campaign code can use this without knowing
--- anything about UDP, UI state, or the model provider.
 function campaign.capability_state()
   return {
     world_id = campaign.get_world_id(),

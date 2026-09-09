@@ -102,6 +102,9 @@ function transport.ensure_storage()
   if type(state.daemon_session_id) ~= "string" then
     state.daemon_session_id = ""
   end
+  if state.pending_hello_seq ~= nil and type(state.pending_hello_seq) ~= "number" then
+    state.pending_hello_seq = nil
+  end
   if type(state.error_until_tick) ~= "number" then
     state.error_until_tick = -1
   end
@@ -311,17 +314,20 @@ function transport.send_hello(player)
   storage.transport.last_packet_received = -1
   storage.transport.last_heartbeat_received = -1
 
+  campaign.clear_runtime_session_id()
+  local hello_seq = next_control_seq()
+  storage.transport.pending_hello_seq = hello_seq
+
   local payload = {
     mod_version = "0.2.0",
     factorio_version = "2.0",
     world_id = campaign.get_world_id(),
     conversation_head = campaign.get_conversation_head(),
     player_name = player.name,
-    capabilities = campaign.get_capabilities(),
-    client_session_id = campaign.get_runtime_session_id()
+    capabilities = campaign.get_capabilities()
   }
 
-  local pkt = protocol.create_packet("hello", "", next_control_seq(), payload)
+  local pkt = protocol.create_packet("hello", "", hello_seq, payload)
   local sent, err = transport.send_raw(pkt, player)
   storage.transport.last_hello_sent = now()
   if not sent then
@@ -330,7 +336,7 @@ function transport.send_hello(player)
   end
 
   transport.set_status("connecting", player)
-  util.log("sent hello to daemon (world_id=" .. payload.world_id .. ", head=" .. payload.conversation_head .. ")")
+  util.log("sent hello to daemon (world_id=" .. tostring(payload.world_id or "<unbound>") .. ", head=" .. payload.conversation_head .. ")")
   return true
 end
 
@@ -341,11 +347,17 @@ function transport.send_heartbeat(player)
     return false, "no_player"
   end
 
+  local world_id = campaign.get_world_id()
+  local client_session_id = campaign.get_runtime_session_id()
+  if not world_id or not client_session_id then
+    return false, "session_unbound"
+  end
+
   local pkt = protocol.create_packet("heartbeat", "", next_control_seq(), {
     ping_tick = now(),
     state = storage.transport.status,
-    world_id = campaign.get_world_id(),
-    client_session_id = campaign.get_runtime_session_id(),
+    world_id = world_id,
+    client_session_id = client_session_id,
     daemon_session_id = storage.transport.daemon_session_id ~= "" and storage.transport.daemon_session_id or nil
   })
   local sent, err = transport.send_raw(pkt, player)
@@ -364,6 +376,10 @@ function transport.can_start_exchange(player)
   end
   if storage.transport.status ~= "ready" then
     return false, storage.transport.status
+  end
+  if not campaign.get_world_id() or not campaign.get_runtime_session_id() then
+    transport.set_status("connecting", player)
+    return false, "connecting"
   end
   if storage.transport.last_packet_received < 0 or now() - storage.transport.last_packet_received > HEARTBEAT_TIMEOUT then
     mark_offline(player, "heartbeat_timeout")
@@ -552,13 +568,47 @@ local function handle_packet_impl(event)
   local payload = pkt.payload
 
   if ptype == "hello_ack" then
-    if not world_matches(payload, false) then
-      log_packet_drop("hello_ack belongs to another world")
-      return
-    end
-    if payload.client_session_id ~= nil and payload.client_session_id ~= campaign.get_runtime_session_id() then
-      log_packet_drop("hello_ack belongs to another client session")
-      return
+    local pending_hello_seq = storage.transport.pending_hello_seq
+
+    if pending_hello_seq ~= nil then
+      if tonumber(payload.hello_seq) ~= pending_hello_seq then
+        log_packet_drop("hello_ack does not match the current hello")
+        return
+      end
+
+      local assigned_world_id, valid_world = packet_world(payload)
+      if not valid_world or not assigned_world_id then
+        log_packet_drop("hello_ack has no valid assigned world")
+        return
+      end
+
+      local current_world_id = campaign.get_world_id()
+      if current_world_id == nil then
+        local bound, bind_err = campaign.set_world_id(assigned_world_id)
+        if not bound then
+          log_packet_drop("could not bind assigned world: " .. tostring(bind_err))
+          return
+        end
+      elseif current_world_id ~= assigned_world_id then
+        log_packet_drop("hello_ack belongs to another world")
+        return
+      end
+
+      local session_ok, session_err = campaign.set_runtime_session_id(payload.client_session_id)
+      if not session_ok then
+        log_packet_drop("hello_ack has invalid runtime session: " .. tostring(session_err))
+        return
+      end
+      storage.transport.pending_hello_seq = nil
+    else
+      if not world_matches(payload, false) then
+        log_packet_drop("hello_ack belongs to another world")
+        return
+      end
+      if payload.client_session_id ~= nil and payload.client_session_id ~= campaign.get_runtime_session_id() then
+        log_packet_drop("hello_ack belongs to another client session")
+        return
+      end
     end
 
     if not update_daemon_session(payload, player) then
@@ -595,11 +645,22 @@ local function handle_packet_impl(event)
     mark_packet_received(true)
     local generation_changed = previous_daemon_session_id ~= ""
       and incoming_daemon_session_id ~= previous_daemon_session_id
-    if generation_changed
-      or storage.transport.status == "connecting"
+    if generation_changed then
+      campaign.clear_runtime_session_id()
+      storage.transport.pending_hello_seq = nil
+      storage.transport.last_hello_sent = -HEARTBEAT_INTERVAL
+      transport.set_status("offline", player)
+      return
+    end
+
+    if storage.transport.status == "connecting"
       or storage.transport.status == "offline"
       or storage.transport.status == "error" then
-      transport.set_status("ready", player)
+      if campaign.get_runtime_session_id() then
+        transport.set_status("ready", player)
+      else
+        transport.set_status("connecting", player)
+      end
     end
 
   elseif ptype == "assistant_start" then
@@ -759,6 +820,8 @@ local function reset_runtime_connection(player)
   end
   runtime_bootstrapped = true
   transport.abort_active_exchange(player, "The Factorio session was reloaded.")
+  campaign.clear_runtime_session_id()
+  storage.transport.pending_hello_seq = nil
   storage.transport.last_packet_received = -1
   storage.transport.last_heartbeat_received = -1
   storage.transport.last_hello_sent = -HEARTBEAT_INTERVAL
@@ -815,8 +878,12 @@ function transport.on_tick()
     return
   end
 
-  if status == "offline" or status == "connecting" then
+  if status == "offline" then
     if now() - storage.transport.last_hello_sent >= HEARTBEAT_INTERVAL then
+      transport.send_hello(player)
+    end
+  elseif status == "connecting" then
+    if now() - storage.transport.last_hello_sent >= HEARTBEAT_TIMEOUT then
       transport.send_hello(player)
     end
   elseif status == "ready" or status == "thinking" or status == "streaming" or status == "error" then

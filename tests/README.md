@@ -10,7 +10,7 @@ Run from the repository root:
 python -m unittest discover -s tests -t . -v
 ```
 
-The current baseline result is `Ran 59 tests` / `OK` on Python 3.14.7.
+The current baseline result is `Ran 61 tests` / `OK` on Python 3.14.7.
 
 Pytest is optional. With `uv` available, run it without changing the project
 environment:
@@ -19,7 +19,7 @@ environment:
 uvx --from pytest pytest -q
 ```
 
-The current result is `59 passed, 60 subtests passed`.
+The current result is `61 passed, 60 subtests passed`.
 
 ## Static validation
 

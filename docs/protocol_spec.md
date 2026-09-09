@@ -60,9 +60,9 @@ The IDs have different ownership and lifetimes:
 
 | Field | Owner | Lifetime/meaning |
 | --- | --- | --- |
-| `world_id` | Factorio save | Persisted save identity. The daemon uses it to isolate timelines. |
+| `world_id` | daemon on first hello → Factorio save | Random persisted save identity. A new unbound save omits it once; the daemon assigns it and Factorio persists it. |
 | `conversation_head` | Factorio save | Persisted completed head; `turn_0` is the virtual root. |
-| `client_session_id` | Factorio runtime | Fresh runtime connection identity; not trusted as durable history. |
+| `client_session_id` | daemon handshake → Factorio runtime | Fresh nondeterministic connection identity; never durable history. |
 | `request_id` | Factorio runtime | Unique request reference for one submitted message. |
 | `turn_id` / `client_turn_id` | Factorio runtime | Provisional client reference; may rewind with a save. |
 | `turn_id` in `assistant_end` | daemon | Canonical `turn_<random>` ID, globally unique in SQLite. |
@@ -81,7 +81,7 @@ model history.
 
 ### `hello` — mod → daemon
 
-Sent after player join, save reload, or reconnect.
+Sent after player join, save reload, or reconnect. A brand-new/unmigrated save may omit `world_id`; the daemon assigns one in `hello_ack`. Product clients also omit `client_session_id` so the daemon can supply a fresh runtime nonce.
 
 ```json
 {

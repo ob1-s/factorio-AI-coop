@@ -34,6 +34,20 @@ class ProductionContractTests(unittest.TestCase):
             r"transport\.send_raw\(pkt,\s*player\)\s*\n\s*transport\.set_status\(\"thinking\"",
             "a failed UDP send must not leave the UI thinking",
         )
+
+    def test_factorio_does_not_mint_identity_from_deterministic_map_rng(self) -> None:
+        campaign = source("mod/FactorioCompanion/scripts/companion/campaign.lua")
+        daemon = source("bridge/daemon.py")
+        transport = source("mod/FactorioCompanion/scripts/companion/transport_udp.lua")
+        self.assertNotIn(
+            "create_random_generator",
+            campaign,
+            "identity must not come from Factorio's deterministic map RNG",
+        )
+        self.assertIn("campaign.set_world_id", transport)
+        self.assertIn('f"world_{uuid.uuid4().hex}"', daemon)
+        self.assertIn('f"session_{uuid.uuid4().hex}"', daemon)
+
     def test_capability_change_does_not_raise_a_built_in_event_as_custom(self) -> None:
         text = source("mod/FactorioCompanion/scripts/companion/campaign.lua")
         self.assertNotRegex(

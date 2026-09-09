@@ -37,7 +37,7 @@ script.on_init(function()
   for _, player in pairs(game.players) do
     init_player(player)
   end
-  util.log("initialized, version " .. remote_if.version .. ", world_id: " .. campaign.get_world_id())
+  util.log("initialized, version " .. remote_if.version .. ", world_id: " .. tostring(campaign.get_world_id() or "<unbound>"))
 end)
 
 

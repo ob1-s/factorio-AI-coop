@@ -123,6 +123,41 @@ class DaemonIntegrationTests(unittest.TestCase):
         self.assertTrue(payload.get("daemon_session_id"))
         self.assertEqual(payload.get("status"), "ready")
 
+
+    def test_unbound_hello_gets_unique_daemon_owned_identities(self) -> None:
+        hello_payload = {
+            "mod_version": "test-mod",
+            "factorio_version": "2.0",
+            "conversation_head": "turn_0",
+            "player_name": "test-engineer",
+            "capabilities": ["telemetry"],
+        }
+
+        self.peer.send_packet(
+            self.daemon.address,
+            "hello",
+            seq=7,
+            payload=hello_payload,
+        )
+        first = self.peer.wait_for_type("hello_ack")["payload"]
+
+        other = UdpPeer()
+        self.addCleanup(other.close)
+        other.send_packet(
+            self.daemon.address,
+            "hello",
+            seq=11,
+            payload=hello_payload,
+        )
+        second = other.wait_for_type("hello_ack")["payload"]
+
+        self.assertTrue(first["world_id"].startswith("world_"))
+        self.assertTrue(first["client_session_id"].startswith("session_"))
+        self.assertEqual(first["hello_seq"], 7)
+        self.assertEqual(second["hello_seq"], 11)
+        self.assertNotEqual(first["world_id"], second["world_id"])
+        self.assertNotEqual(first["client_session_id"], second["client_session_id"])
+
     def test_user_message_produces_start_deltas_and_authoritative_end(self) -> None:
         answer = "Olá, fábrica 🚀"
         self.llm.add_response(

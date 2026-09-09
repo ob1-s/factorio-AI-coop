@@ -609,8 +609,31 @@ class CompanionDaemon:
 
     def _handle_hello(self, packet: Mapping[str, Any], address: Address) -> None:
         payload = packet["payload"]
-        world_id = payload["world_id"]
         head = payload.get("conversation_head") or "turn_0"
+
+        # Factorio's runtime Lua state is deterministic. It cannot safely mint
+        # a globally unique save identity or a fresh process/session nonce.
+        # New saves therefore omit world_id on their first hello; the external
+        # daemon owns the entropy boundary and returns the assigned ID.
+        announced_world_id = payload.get("world_id")
+        if announced_world_id:
+            world_id = announced_world_id
+        else:
+            if head != "turn_0":
+                self._send_error(
+                    address,
+                    "",
+                    "HISTORY_ERROR",
+                    "An unbound save must begin at the root conversation.",
+                )
+                return
+            world_id = f"world_{uuid.uuid4().hex}"
+
+        # Product Factorio clients omit client_session_id on hello. A supplied
+        # value is retained only for backwards compatibility/test peers.
+        client_session_id = (
+            payload.get("client_session_id") or f"session_{uuid.uuid4().hex}"
+        )
         capabilities = tuple(payload.get("capabilities") or ())
         now = self._clock()
 
@@ -640,7 +663,7 @@ class CompanionDaemon:
                 conversation_head=head,
                 capabilities=capabilities,
                 player_name=payload.get("player_name", ""),
-                client_session_id=payload.get("client_session_id", ""),
+                client_session_id=client_session_id,
                 last_seen=now,
             )
             self._peers[world_id] = peer
@@ -679,6 +702,9 @@ class CompanionDaemon:
                 "status": "ready",
                 "daemon_session_id": self.daemon_session_id,
             }
+            # Echo the initiating hello sequence so the Factorio side can
+            # reject a delayed acknowledgement from an older handshake.
+            ack["hello_seq"] = int(packet.get("seq", 0))
             if peer.client_session_id:
                 ack["client_session_id"] = peer.client_session_id
             self._send_packet("hello_ack", "", 1, ack, address)
